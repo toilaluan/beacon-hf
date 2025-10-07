@@ -9,6 +9,9 @@ dependencies = [
     "datasets>=4.1.1",
     "jinja2>=3.1.6",
     "matplotlib>=3.10.6",
+    "numpy>=2.0.0",
+    "peft>=0.14.0",
     "torch>=2.8.0",
     "transformers>=4.57.0",
+    "wandb>=0.17.0",
 ]
