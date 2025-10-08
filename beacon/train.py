@@ -19,15 +19,9 @@ from beacon.data import (
     tokenize_conversation,
 )
 
-try:
-    import wandb
-except ImportError:  # pragma: no cover - wandb optional at import time
-    wandb = None
+import wandb
+from peft import LoraConfig, get_peft_model
 
-try:
-    from peft import LoraConfig, get_peft_model
-except ImportError as exc:  # pragma: no cover
-    raise RuntimeError("The 'peft' package is required for LoRA fine-tuning.") from exc
 
 
 def parse_args() -> argparse.Namespace:
