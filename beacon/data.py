@@ -49,24 +49,19 @@ def tokenize_conversation(
     special_token_ids = set(tokenizer.all_special_ids)
 
     tokenized: List[int] = []
-    current_start = 0
-
-    for idx, token in enumerate(ids):
-        if token not in special_token_ids:
+    special_indexes = [i for i, id in enumerate(ids) if id in special_token_ids]
+    
+    for start, end in zip(special_indexes[:-1], special_indexes[1:]):
+        segment = ids[start:end]
+        if all(id in special_token_ids for id in segment):
+            tokenized.extend(segment)
             continue
-        if idx > current_start:
-            segment = ids[current_start:idx]
-            tokenized.extend(
-                inject_checkpoint(segment, stride=stride, checkpoint_id=tokenizer.cls_token_id)
-            )
-        tokenized.append(token)
-        current_start = idx + 1
-
-    if current_start < len(ids):
-        segment = ids[current_start:]
-        tokenized.extend(
-            inject_checkpoint(segment, stride=stride, checkpoint_id=tokenizer.cls_token_id)
-        )
+        tokenized.extend(inject_checkpoint(segment, stride=stride, checkpoint_id=tokenizer.cls_token_id))
+    last_segment = ids[special_indexes[-1]:]
+    if all(id in special_token_ids for id in last_segment):
+        tokenized.extend(last_segment)
+    else:
+        tokenized.extend(inject_checkpoint(last_segment, stride=stride, checkpoint_id=tokenizer.cls_token_id))
 
     return TokenizedConversation(tokenized)
 

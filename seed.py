@@ -18,6 +18,7 @@ def inject_checkpoint(ids: list[int], stride: int, checkpoint_id: int) -> list[i
         injected_ids.extend(ids[i:i+stride])
         if i+stride < len(ids):
             injected_ids.append(checkpoint_id)
+    print(injected_ids, stride, checkpoint_id)
     return injected_ids
 
 
@@ -30,6 +31,9 @@ def process_item(item: dict, stride: int = 16, tokenize: bool = True) -> list[in
     for start, end in zip(special_indexes, special_indexes[1:]):
         checkpointed_segment = inject_checkpoint(ids[start:end], stride=stride, checkpoint_id=tokenizer.cls_token_id)
         output_ids.extend(checkpointed_segment)
+
+    last_segment = inject_checkpoint(ids[special_indexes[-1]:], stride=stride, checkpoint_id=tokenizer.cls_token_id)
+    output_ids.extend(last_segment)
     if not tokenize:
         text = tokenizer.decode(output_ids)
         return text

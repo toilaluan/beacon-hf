@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import numpy as np
+from multiprocessing import get_context
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -90,7 +91,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on processed samples")
     parser.add_argument("--streaming", action="store_true", help="Enable streaming dataset loading")
     parser.add_argument("--dataset-trust-remote-code", action="store_true", help="Allow remote code for dataset")
+    parser.add_argument("--num-workers", type=int, default=1, help="Tokenization worker processes (1 = inline)")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Optional cap on processed tokens")
     return parser.parse_args()
+
+
+_WORKER_TOKENIZER = None
+_WORKER_STRIDE = 0
+
+
+def _worker_init(tokenizer_name: str, checkpoint_token: str, stride: int) -> None:
+    global _WORKER_TOKENIZER, _WORKER_STRIDE
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    if tokenizer.cls_token is None or tokenizer.cls_token == "":
+        tokenizer.add_special_tokens({"cls_token": checkpoint_token})
+    elif tokenizer.cls_token != checkpoint_token:
+        # Keep the tokenizer-provided CLS token for consistency.
+        pass
+    _WORKER_TOKENIZER = tokenizer
+    _WORKER_STRIDE = stride
+
+
+def _process_sample(payload: tuple[int, dict]) -> tuple[int, Optional[List[int]]]:
+    idx, sample = payload
+    messages = sample.get("messages")
+    if not messages:
+        return idx, None
+    conversation = tokenize_conversation(messages, tokenizer=_WORKER_TOKENIZER, stride=_WORKER_STRIDE)
+    return idx, conversation.token_ids
+
+
+def _enumerate_samples(dataset: Iterable[dict], max_samples: Optional[int]) -> Iterable[tuple[int, dict]]:
+    for idx, sample in enumerate(dataset):
+        if max_samples is not None and idx >= max_samples:
+            break
+        yield idx, sample
 
 
 def main() -> None:
@@ -111,6 +146,7 @@ def main() -> None:
         "tokenizer": args.tokenizer,
         "checkpoint_token": tokenizer.cls_token,
         "stride": str(args.stride),
+        "max_tokens": str(args.max_tokens),
     }
 
     print(f"Preparing dataset {args.dataset}:{args.split} (streaming={args.streaming})")
@@ -127,22 +163,66 @@ def main() -> None:
         metadata=metadata,
     )
 
-    for idx, sample in enumerate(dataset):
-        if args.max_samples is not None and idx >= args.max_samples:
-            break
+    sample_iterable = _enumerate_samples(dataset, args.max_samples)
+    token_limit = args.max_tokens if (args.max_tokens is None or args.max_tokens > 0) else None
+    stop_requested = False
 
-        messages = sample.get("messages")
-        if not messages:
-            continue
+    if args.num_workers <= 1:
+        for idx, sample in sample_iterable:
+            if token_limit is not None and writer.total_tokens >= token_limit:
+                stop_requested = True
+                break
 
-        conversation = tokenize_conversation(messages, tokenizer=tokenizer, stride=args.stride)
-        writer.add_document(conversation.token_ids)
+            messages = sample.get("messages")
+            if not messages:
+                continue
 
-        if (idx + 1) % 1000 == 0:
-            print(
-                f"Processed {idx + 1} samples "
-                f"({writer.total_documents} docs, {writer.total_tokens} tokens written so far)"
-            )
+            conversation = tokenize_conversation(messages, tokenizer=tokenizer, stride=args.stride)
+            writer.add_document(conversation.token_ids)
+
+            if token_limit is not None and writer.total_tokens >= token_limit:
+                stop_requested = True
+                break
+
+            if (idx + 1) % 1000 == 0:
+                print(
+                    f"Processed {idx + 1} samples "
+                    f"({writer.total_documents} docs, {writer.total_tokens} tokens written so far)"
+                )
+
+    else:
+        ctx = get_context("spawn")
+        pool = ctx.Pool(
+            processes=args.num_workers,
+            initializer=_worker_init,
+            initargs=(args.tokenizer, tokenizer.cls_token, args.stride),
+        )
+        try:
+            for idx, token_ids in pool.imap(_process_sample, sample_iterable, chunksize=64):
+                if token_limit is not None and writer.total_tokens >= token_limit:
+                    stop_requested = True
+                    break
+
+                if token_ids is None:
+                    continue
+
+                writer.add_document(token_ids)
+
+                if token_limit is not None and writer.total_tokens >= token_limit:
+                    stop_requested = True
+                    break
+
+                if (idx + 1) % 1000 == 0:
+                    print(
+                        f"Processed {idx + 1} samples "
+                        f"({writer.total_documents} docs, {writer.total_tokens} tokens written so far)"
+                    )
+        finally:
+            if stop_requested:
+                pool.terminate()
+            else:
+                pool.close()
+            pool.join()
 
     writer.finalize()
     print(

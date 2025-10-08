@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 import random
-from collections import deque
 from pathlib import Path
-from typing import Deque, Generator, Iterable, List, Optional, Sequence, Tuple
+from typing import Generator, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -118,7 +117,10 @@ def distributed_sequence_generator(
                     end_selected_docs.append(end)
                     total_selected_length += end - start
                     if total_selected_length >= sample_span:
-                        items = [tokens[start:end] for start, end in zip(start_selected_docs, end_selected_docs)]
+                        items = []
+                        for start, end in zip(start_selected_docs, end_selected_docs):
+                            items.extend(tokens[start:end])
+
                         yield torch.tensor(items, dtype=torch.long)
                         start_selected_docs.clear()
                         end_selected_docs.clear()
