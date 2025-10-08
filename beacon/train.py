@@ -1,23 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
-from dist_dataloader import DistributedTokenDataset
+from beacon.dist_dataloader import DistributedTokenDataset
 from beacon.data import (
     build_position_ids,
     create_attention_mask,
     tokenize_conversation,
 )
+from beacon.val_sample import MESSAGES
 
 import wandb
 from peft import LoraConfig, get_peft_model
@@ -40,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm.")
     parser.add_argument("--log-interval", type=int, default=10, help="Steps between loss logging.")
     parser.add_argument("--sample-interval", type=int, default=100, help="Steps between text sampling.")
-    parser.add_argument("--sample-max-new-tokens", type=int, default=128, help="Maximum generation length.")
+    parser.add_argument("--sample-max-new-tokens", type=int, default=16, help="Maximum generation length.")
     parser.add_argument("--data-seed", type=int, default=1234, help="Deterministic data shuffle seed.")
     parser.add_argument("--doc-multiple-of", type=int, default=1, help="Floor documents to multiple of n tokens.")
     parser.add_argument("--checkpoint-token", default="<|checkpoint|>", help="CLS token used for beacons.")
@@ -80,8 +82,11 @@ def setup_tokenizer(model_name: str, checkpoint_token: str) -> AutoTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tokenizer.cls_token is None or tokenizer.cls_token != checkpoint_token:
         tokenizer.add_special_tokens({"cls_token": checkpoint_token})
+    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     if tokenizer.eos_token_id is None:
         raise ValueError("Tokenizer must define an eos_token for causal LM training.")
+
+    assert tokenizer.pad_token_id != tokenizer.eos_token_id, "pad_token_id and eos_token_id should be different"
     return tokenizer
 
 
@@ -99,23 +104,24 @@ def prepare_model(
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
-        device_map=None,
+        device_map="cuda",
         attn_implementation="flex_attention",
     )
     if model.get_input_embeddings().num_embeddings != len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
 
-    lora_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=list(lora_target_modules),
-    )
-    model = get_peft_model(model, lora_config)
+    # lora_config = LoraConfig(
+    #     r=lora_r,
+    #     lora_alpha=lora_alpha,
+    #     lora_dropout=lora_dropout,
+    #     bias="none",
+    #     task_type="CAUSAL_LM",
+    #     target_modules=list(lora_target_modules),
+    # )
+    # model = get_peft_model(model, lora_config)
     model.to(device)
     model.train()
+    model = torch.compile(model)
     return model
 
 
@@ -148,7 +154,7 @@ def average_across_ranks(value: torch.Tensor, world_size: int) -> torch.Tensor:
 def generate_sample(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
-    messages: List[dict],
+    messages: list[dict],
     *,
     stride: int,
     max_new_tokens: int,
@@ -158,33 +164,64 @@ def generate_sample(
     model.eval()
 
     with torch.no_grad():
-        conversation = tokenize_conversation(messages, tokenizer=tokenizer, stride=stride)
-        generated = torch.tensor(conversation.token_ids, dtype=torch.long, device=device)
-        special_token_ids = torch.tensor(tokenizer.all_special_ids, device=device)
+        # IMPORTANT: use add_generation_prompt=True so the template contains "assistant" header
+        conv = tokenize_conversation(
+            messages,
+            tokenizer=tokenizer,
+            stride=stride,
+            add_generation_prompt=False,
+            continue_final_message=True,
+        )
 
-        for _ in range(max_new_tokens):
-            attention_mask, _ = create_attention_mask(
-                generated,
+        # prefix tokens (what was given as conditioning)
+        generated = torch.tensor(conv.token_ids, dtype=torch.long, device=device).unsqueeze(0)
+        print(tokenizer.decode(generated[0].tolist()))
+        print("--------------------------------")
+        prefix_len = generated.size(1)
+
+        
+
+        for i in range(max_new_tokens):
+            special_token_ids = torch.tensor(tokenizer.all_special_ids, device=device)
+            tokens_since_checkpoint = 0
+
+            attn_mask, mask_mod = create_attention_mask(
+                generated[0],
                 special_token_ids=special_token_ids,
                 checkpoint_id=tokenizer.cls_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.pad_token_id,
             )
-            position_ids = build_position_ids(generated, tokenizer.eos_token_id).unsqueeze(0)
-            with autocast(device_type=device.type, enabled=False):
-                outputs = model(
-                    generated.unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+            from visualize import visualize_attention_scores
+            q = torch.zeros(1, 1, len(conv.token_ids), 16, device=device)
+            k = torch.zeros(1, 1, len(conv.token_ids), 16, device=device)
+            visualize_attention_scores(q, k, mask_mod=mask_mod, device=device, name="attention_mask")
+            raise Exception("Stop here")
+            pos_ids = build_position_ids(generated[0], tokenizer.eos_token_id).unsqueeze(0)
+
+            # keep AMP consistent with training; your weights are bf16 already
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=False):
+                out = model(
+                    generated,
+                    attention_mask=attn_mask,
+                    # position_ids=pos_ids,
                 )
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1)
-            generated = torch.cat([generated, next_token.squeeze(0)], dim=0)
-            if generated[-1].item() == tokenizer.eos_token_id:
-                break
-        text = tokenizer.decode(generated.tolist())
+            next_id = out.logits[:, -1, :].argmax(dim=-1)  # greedy
+
+            generated = torch.cat([generated, next_id.unsqueeze(0)], dim=1)
+
+            print(f"[{i}]", tokenizer.decode(next_id.tolist()))
+
+            # if next_id.item() == tokenizer.eos_token_id:
+            #     break
+
+        # decode only the new tokens
+        new_tokens = generated[0, prefix_len:].tolist()
+        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     if was_training:
         model.train()
     return text
+
 
 
 def main() -> None:
@@ -206,6 +243,9 @@ def main() -> None:
         lora_target_modules=args.lora_target_modules,
     )
 
+    print(model.get_input_embeddings().weight.shape)
+    print(tokenizer.vocab_size, tokenizer.cls_token_id, tokenizer.eos_token_id)
+
     model = DDP(model, device_ids=[local_rank])
 
     dataset = DistributedTokenDataset(
@@ -213,7 +253,6 @@ def main() -> None:
         sequence_length=args.sequence_length,
         local_rank=local_rank,
         world_size=world_size,
-        doc_multiple_of_n=args.doc_multiple_of,
         base_seed=args.data_seed,
     )
     dataloader = DataLoader(
@@ -250,6 +289,13 @@ def main() -> None:
     data_iter = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
 
+    debug_messages = copy.deepcopy(MESSAGES)
+    debug_messages[-1]["content"] = "Let me think more about it. Capital of France is Paris, capital of Italy is Rome, capital of Germany is Berlin..."
+    
+    debug_sequence = tokenize_conversation(debug_messages, tokenizer=tokenizer, stride=args.checkpoint_stride, add_generation_prompt=False, continue_final_message=False, end_doc_token=tokenizer.pad_token_id)
+    print(tokenizer.decode(debug_sequence.token_ids))
+    print("--------------------------------")
+
     while global_step < args.max_steps:
         step_start = time.time()
         step_loss_sum = 0.0
@@ -265,32 +311,43 @@ def main() -> None:
             if batch.dim() == 1:
                 batch = batch.unsqueeze(0)
 
-            batch = batch.to(device)
-
             for sequence in batch:
-                inputs = sequence[:-1]
-                labels = sequence[1:]
+                # sequence = sequence[:args.sequence_length+1]
+                sequence = torch.tensor(debug_sequence.token_ids, dtype=torch.long, device=device)
+                inputs = sequence[:-1].clone().to(device, torch.int64)
+                labels = sequence[1:].clone().to(device, torch.int64)
 
-                attention_mask, _ = create_attention_mask(
+                # print(tokenizer.decode(inputs.tolist()))
+                # print(tokenizer.decode(labels.tolist()))
+                # print("--------------------------------")
+
+                attention_mask, mask_mod = create_attention_mask(
                     inputs,
                     special_token_ids=special_token_ids,
                     checkpoint_id=tokenizer.cls_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                position_ids = build_position_ids(inputs, tokenizer.eos_token_id).unsqueeze(0)
+                    eos_token_id=tokenizer.pad_token_id,
 
-                with autocast(
-                    device_type=device.type,
-                    dtype=amp_dtype,
-                    enabled=amp_enabled,
-                ):
+                )
+
+                # from visualize import visualize_attention_scores
+                # q = torch.zeros(1, 1, len(inputs), 16, device=device)
+                # k = torch.zeros(1, 1, len(inputs), 16, device=device)
+                # visualize_attention_scores(q, k, mask_mod=mask_mod, device=device, name="attention_mask")
+                # raise Exception("Stop here")
+                
+                position_ids = build_position_ids(inputs, tokenizer.pad_token_id)
+
+                # assign -100 to cls token
+                labels[labels == tokenizer.cls_token_id] = -100
+
+                with autocast(enabled=False, dtype=torch.bfloat16, device_type=device.type):
                     outputs = model(
                         inputs.unsqueeze(0),
                         attention_mask=attention_mask,
-                        labels=labels.unsqueeze(0),
-                        position_ids=position_ids,
+                        position_ids=position_ids.unsqueeze(0),
                     )
-                    loss = outputs.loss
+                logits = outputs.logits
+                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
 
                 step_loss_sum += loss.item()
                 processed_sequences += 1
@@ -331,12 +388,11 @@ def main() -> None:
             )
 
         if is_main_process and global_step % args.sample_interval == 0:
-            messages = [{"content": args.sample_user_content, "role": "user"}]
             with torch.no_grad():
                 sample_text = generate_sample(
                     model.module,
                     tokenizer,
-                    messages,
+                    MESSAGES,
                     stride=args.checkpoint_stride,
                     max_new_tokens=args.sample_max_new_tokens,
                     device=device,

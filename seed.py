@@ -11,14 +11,13 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
 
 def inject_checkpoint(ids: list[int], stride: int, checkpoint_id: int) -> list[int]:
+    if all(id in tokenizer.all_special_ids for id in ids):
+        return ids
     injected_ids = []
     if len(ids) < stride:
         return ids
     for i in range(0, len(ids), stride):
         injected_ids.extend(ids[i:i+stride])
-        if i+stride < len(ids):
-            injected_ids.append(checkpoint_id)
-    print(injected_ids, stride, checkpoint_id)
     return injected_ids
 
 
@@ -102,11 +101,12 @@ visualize_attention_scores(query, key, mask_mod=mask_mod, device="cuda", name="a
 
 # build position ids for each docs
 
-docs = (ids == tokenizer.eos_token_id).long().cumsum(0)
-n_docs = docs.max()
+docs = (inputs == tokenizer.eos_token_id).long().cumsum(0)
+unique_docs = docs.unique()
 docs_position_ids = []
-for i in range(n_docs):
+for i in unique_docs:
     doc_size = (docs == i).sum()
+    print(doc_size)
     position_ids = torch.arange(doc_size, device="cuda")
     docs_position_ids.append(position_ids)
 docs_position_ids = torch.cat(docs_position_ids, dim=0)
@@ -116,8 +116,8 @@ print(docs_position_ids.shape)
 # example of loss
 
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", device_map="cuda", dtype=torch.bfloat16, attn_implementation="flex_attention")
-
-with torch.no_grad():
-    outputs = model(inputs.unsqueeze(0), attention_mask=mask, labels=labels.unsqueeze(0), position_ids=docs_position_ids.unsqueeze(0))
+print(inputs.shape, labels.shape, docs_position_ids.shape)
+print(inputs.device, labels.device, docs_position_ids.device)
+outputs = model(inputs.unsqueeze(0), attention_mask=mask, labels=labels.unsqueeze(0), position_ids=docs_position_ids.unsqueeze(0))
 
 print(outputs.loss)

@@ -13,10 +13,10 @@ class TokenizedConversation:
     token_ids: List[int]
 
 
-def inject_checkpoint(ids: Sequence[int], stride: int, checkpoint_id: int) -> List[int]:
+def inject_checkpoint(ids: Sequence[int], stride: int, checkpoint_id: int, tokenizer: PreTrainedTokenizerBase) -> List[int]:
     """Insert `checkpoint_id` every `stride` tokens to form attention blocks."""
-    if stride <= 0:
-        raise ValueError("stride must be > 0")
+    if all(id in tokenizer.all_special_ids for id in ids):
+        return ids
 
     injected: List[int] = []
     if len(ids) <= stride:
@@ -25,8 +25,6 @@ def inject_checkpoint(ids: Sequence[int], stride: int, checkpoint_id: int) -> Li
     for start in range(0, len(ids), stride):
         stop = min(start + stride, len(ids))
         injected.extend(ids[start:stop])
-        if stop < len(ids):
-            injected.append(checkpoint_id)
     return injected
 
 
@@ -34,6 +32,9 @@ def tokenize_conversation(
     messages: Iterable[dict],
     tokenizer: PreTrainedTokenizerBase,
     stride: int,
+    end_doc_token: int = None,
+    add_generation_prompt: bool = False,
+    continue_final_message: bool = False,
 ) -> TokenizedConversation:
     """
     Apply chat template, then inject checkpoint tokens between template segments.
@@ -45,7 +46,9 @@ def tokenize_conversation(
     if tokenizer.cls_token is None:
         raise ValueError("Tokenizer must define a cls_token used as checkpoint.")
 
-    ids = tokenizer.apply_chat_template(messages, tokenize=True)
+    ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message)
+    if end_doc_token is not None:
+        ids.append(end_doc_token)
     special_token_ids = set(tokenizer.all_special_ids)
 
     tokenized: List[int] = []
@@ -56,12 +59,12 @@ def tokenize_conversation(
         if all(id in special_token_ids for id in segment):
             tokenized.extend(segment)
             continue
-        tokenized.extend(inject_checkpoint(segment, stride=stride, checkpoint_id=tokenizer.cls_token_id))
+        tokenized.extend(inject_checkpoint(segment, stride=stride, checkpoint_id=tokenizer.cls_token_id, tokenizer=tokenizer))
     last_segment = ids[special_indexes[-1]:]
     if all(id in special_token_ids for id in last_segment):
         tokenized.extend(last_segment)
     else:
-        tokenized.extend(inject_checkpoint(last_segment, stride=stride, checkpoint_id=tokenizer.cls_token_id))
+        tokenized.extend(inject_checkpoint(last_segment, stride=stride, checkpoint_id=tokenizer.cls_token_id, tokenizer=tokenizer))
 
     return TokenizedConversation(tokenized)
 
@@ -90,13 +93,11 @@ def create_attention_mask(
     beacon_ids = is_checkpoint.long().cumsum(0) - is_checkpoint.long()
     docs = (ids == eos_token_id).long().cumsum(0)
 
-    def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
+    def mask_mod(b, h, q_idx, kv_idx):
         causal = q_idx >= kv_idx
-        same_beacon = bool((beacon_ids[kv_idx] == beacon_ids[q_idx]).item())
-        same_doc = bool((docs[kv_idx] == docs[q_idx]).item())
-        is_checkpoint_kv = bool(is_checkpoint[kv_idx].item())
-        is_special_kv = bool(is_special[kv_idx].item())
-        return causal and same_doc and (same_beacon or is_checkpoint_kv or is_special_kv)
+        same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
+        same_doc = docs[kv_idx] == docs[q_idx]
+        return causal & same_doc & (same_beacon | is_checkpoint[kv_idx] | is_special[kv_idx])
 
     block_mask = flex_attention.create_block_mask(
         mask_mod, B=1, H=1, Q_LEN=ids.numel(), KV_LEN=ids.numel(), BLOCK_SIZE=block_size
@@ -109,13 +110,11 @@ def build_position_ids(ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
     if ids.ndim != 1:
         raise ValueError("ids must be a 1D tensor")
 
-    position_ids = torch.zeros_like(ids, dtype=torch.long)
-    current = 0
-
-    for idx, token in enumerate(ids.tolist()):
-        position_ids[idx] = current
-        current += 1
-        if token == eos_token_id:
-            current = 0
-
-    return position_ids.to(ids.device)
+    docs = (ids == eos_token_id).long().cumsum(0)
+    unique_docs = docs.unique()
+    position_ids = []
+    for i in unique_docs:
+        doc_size = (docs == i).sum()
+        position_ids.append(torch.arange(doc_size, device=ids.device))
+    position_ids = torch.cat(position_ids, dim=0)
+    return position_ids
