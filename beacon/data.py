@@ -14,17 +14,15 @@ class TokenizedConversation:
 
 
 def inject_checkpoint(ids: Sequence[int], stride: int, checkpoint_id: int, tokenizer: PreTrainedTokenizerBase) -> List[int]:
-    """Insert `checkpoint_id` every `stride` tokens to form attention blocks."""
-    if all(id in tokenizer.all_special_ids for id in ids):
-        return ids
-
-    injected: List[int] = []
-    if len(ids) <= stride:
+    """Insert `checkpoint_id` every `stride` tokens within conversational spans."""
+    if not ids or all(token in tokenizer.all_special_ids for token in ids):
         return list(ids)
 
+    injected: List[int] = []
     for start in range(0, len(ids), stride):
         stop = min(start + stride, len(ids))
         injected.extend(ids[start:stop])
+        injected.append(checkpoint_id)
     return injected
 
 
@@ -73,7 +71,7 @@ def create_attention_mask(
     ids: torch.Tensor,
     special_token_ids: torch.Tensor,
     checkpoint_id: int,
-    eos_token_id: int,
+    eos_token_id: int | None,
     block_size: int = 128,
 ) -> Tuple[flex_attention.BlockMask, Callable[..., bool]]:
     """
@@ -91,7 +89,10 @@ def create_attention_mask(
     is_checkpoint = ids == checkpoint_id
     is_special = torch.isin(ids, special_token_ids)
     beacon_ids = is_checkpoint.long().cumsum(0) - is_checkpoint.long()
-    docs = (ids == eos_token_id).long().cumsum(0)
+    if eos_token_id is None or (ids == eos_token_id).sum() == 0:
+        docs = torch.zeros_like(ids)
+    else:
+        docs = (ids == eos_token_id).long().cumsum(0)
 
     def mask_mod(b, h, q_idx, kv_idx):
         causal = q_idx >= kv_idx

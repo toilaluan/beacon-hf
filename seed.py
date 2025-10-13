@@ -3,121 +3,165 @@ import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from torch.nn.attention import flex_attention
+from typing import Tuple, Callable
 
-sft_dataset = load_dataset("allenai/tulu-3-sft-mixture", split="train", streaming=True)
+def create_attention_mask(
+    ids: torch.Tensor,
+    special_token_ids: torch.Tensor,
+    checkpoint_id: int,
+    eos_token_id: int | None,
+    block_size: int = 128,
+) -> Tuple[flex_attention.BlockMask, Callable[..., bool]]:
+    """
+    Build a causal attention mask that respects checkpoint boundaries.
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    Each checkpoint token opens attention across the preceding stride while
+    still allowing access to earlier checkpoints and special tokens.
+    """
+    if ids.ndim != 1:
+        raise ValueError("ids must be a 1D tensor")
 
-tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
+    device = ids.device
+    special_token_ids = special_token_ids.to(device)
 
-def inject_checkpoint(ids: list[int], stride: int, checkpoint_id: int) -> list[int]:
-    if all(id in tokenizer.all_special_ids for id in ids):
-        return ids
-    injected_ids = []
-    if len(ids) < stride:
-        return ids
-    for i in range(0, len(ids), stride):
-        injected_ids.extend(ids[i:i+stride])
-    return injected_ids
+    is_checkpoint = ids == checkpoint_id
+    is_special = torch.isin(ids, special_token_ids)
 
+    # Beacon groups: each non-checkpoint belongs to the group of the most recent checkpoint (before it)
+    beacon_ids = is_checkpoint.long().cumsum(0) - is_checkpoint.long()
 
-def process_item(item: dict, stride: int = 16, tokenize: bool = True) -> list[int] | str:
-    messages = item["messages"]
-    ids = tokenizer.apply_chat_template(messages, tokenize=True)
-    special_token_ids = tokenizer.all_special_ids
-    special_indexes = [i for i, id in enumerate(ids) if id in special_token_ids]
-    output_ids = []
-    for start, end in zip(special_indexes, special_indexes[1:]):
-        checkpointed_segment = inject_checkpoint(ids[start:end], stride=stride, checkpoint_id=tokenizer.cls_token_id)
-        output_ids.extend(checkpointed_segment)
-
-    last_segment = inject_checkpoint(ids[special_indexes[-1]:], stride=stride, checkpoint_id=tokenizer.cls_token_id)
-    output_ids.extend(last_segment)
-    if not tokenize:
-        text = tokenizer.decode(output_ids)
-        return text
-    return output_ids
-
-
-def create_attention_mask(ids: torch.Tensor, special_token_ids: torch.Tensor, checkpoint_id: int, eot_id: int) -> flex_attention.BlockMask:
-    is_beacons = ids == checkpoint_id
-    is_specials = torch.isin(ids, special_token_ids)
-    beacon_ids = is_beacons.long().cumsum(0) - is_beacons.long()
-    docs = (ids == eot_id).long().cumsum(0)
+    # Doc groups: if no eos_token_id is provided or it never appears, treat entire seq as one doc
+    if eos_token_id is None or (ids == eos_token_id).sum() == 0:
+        docs = torch.zeros_like(ids)
+    else:
+        docs = (ids == eos_token_id).long().cumsum(0)
 
     def mask_mod(b, h, q_idx, kv_idx):
         causal = q_idx >= kv_idx
         same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
         same_doc = docs[kv_idx] == docs[q_idx]
-        return causal & same_doc & (same_beacon | is_beacons[kv_idx] | is_specials[kv_idx])
-    return flex_attention.create_block_mask(mask_mod, B=1, H=1, Q_LEN=len(ids), KV_LEN=len(ids), BLOCK_SIZE=128), mask_mod
+        return causal & same_doc & (same_beacon | is_checkpoint[kv_idx] | is_special[kv_idx])
 
+    block_mask = flex_attention.create_block_mask(
+        mask_mod, B=1, H=1, Q_LEN=ids.numel(), KV_LEN=ids.numel(), BLOCK_SIZE=block_size
+    )
+    return block_mask, mask_mod
 
-# example of caching large dataset into tokens and save to disk then reload into memory as samples
-samples = []
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
-i=0
-for item in sft_dataset:
-    samples.append(process_item(item, stride=8, tokenize=True)[:50])
-    i+=1
-    if i >= 50:
-        break
+# Add checkpoint special token
+tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
+ckpt_id = tokenizer.cls_token_id
 
-# build batch based on max_tokens by concatenating samples, max_tokens in reality is often large like 1024*16
-ids = []
-max_tokens = 256
-for sample in samples:
-    if len(ids) > max_tokens:
-        break
-    ids.extend(sample)
-print(len(ids))
+# Helpful: define eos if present; else None (single-doc behavior)
+eos_id = tokenizer.eos_token_id
 
+# Encode and insert checkpoints every N tokens (training-style)
+input_text = "capital of france is paris, capital of italy is rome, capital of germany is berlin, capital of vietnam is hanoi"
+ids_plain = tokenizer.encode(input_text)
+ckpt_stride = 8
+updated_ids = []
+for i in range(0, len(ids_plain), ckpt_stride):
+    updated_ids.extend(ids_plain[i:i+ckpt_stride])
+    updated_ids.append(ckpt_id)
+input_ids = torch.tensor(updated_ids, device="cuda")
 
-# get divisible by 16 inputs and labels
-ids = torch.tensor(ids[:max_tokens+1],device="cuda")
+print(tokenizer.decode(input_ids.tolist()))
 
-inputs = ids[:-1]
-labels = ids[1:]
+# Load model *after* adding special tokens, then resize embeddings
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    device_map="cuda",
+    dtype=torch.bfloat16,
+    attn_implementation="flex_attention",
+)
+model.resize_token_embeddings(len(tokenizer))
 
-print(inputs.shape)
+from torch.optim import AdamW
+optimizer = AdamW(model.parameters(), lr=1e-4)
 
-# build mask for attention
+train_ids = input_ids[:-1].clone()
+labels    = input_ids[1:].clone()
 
-mask, mask_mod = create_attention_mask(inputs, torch.tensor(tokenizer.all_special_ids,device="cuda"), tokenizer.cls_token_id, tokenizer.eos_token_id)
-print(mask)
+special_ids = set(tokenizer.all_special_ids)
+special_ids.add(ckpt_id)  # ensure our new token is treated as special
+special_ids_tensor = torch.tensor(sorted(special_ids), device="cuda")
 
+attn_mask, mask_mod = create_attention_mask(
+    train_ids,
+    special_token_ids=special_ids_tensor,
+    checkpoint_id=ckpt_id,
+    eos_token_id=eos_id,
+)
 
-# visualize attention scores, dont need for training
-from visualize import visualize_attention_scores
+print(attn_mask)
+print(mask_mod)
 
+# ---------- Fixed: generation helpers ----------
 
-query = torch.zeros(1, 1, len(inputs), 16, device="cuda")
-key = torch.zeros(1, 1, len(inputs), 16, device="cuda")
+def tokens_since_last_ckpt(seq: torch.Tensor, ckpt_token_id: int) -> int:
+    """Count consecutive non-ckpt tokens from the end back to the most recent ckpt (0 if last is ckpt)."""
+    n = 0
+    for t in range(seq.numel() - 1, -1, -1):
+        if int(seq[t].item()) == int(ckpt_token_id):
+            break
+        n += 1
+    return n
 
+def maybe_append_ckpt(seq: torch.Tensor, ckpt_token_id: int, stride: int) -> torch.Tensor:
+    """Append a checkpoint if we've already produced `stride` tokens since the last checkpoint."""
+    if tokens_since_last_ckpt(seq, ckpt_token_id) >= stride:
+        seq = torch.cat([seq, torch.tensor([ckpt_token_id], device=seq.device)], dim=0)
+    return seq
 
-visualize_attention_scores(query, key, mask_mod=mask_mod, device="cuda", name="attention_mask")
+# -------------- Train --------------
+for step in range(1000):
+    optimizer.zero_grad()
+    labels[(labels == tokenizer.cls_token_id).nonzero(as_tuple=True)] = -100
+    outputs = model(train_ids.unsqueeze(0), attention_mask=attn_mask)
+    logits = outputs.logits[0] 
+    valid = (labels != -100)
+    nll = torch.nn.functional.cross_entropy(logits[valid], labels[valid], reduction='none')
+    # Print around each checkpoint boundary
+    loss = nll.mean()
+    loss.backward()
+    optimizer.step()
+    if step % 10 == 0:
+        for i, t in enumerate(train_ids[:-1]):
+            if t.item() == ckpt_id and i+1 < labels.numel():
+                print("after CKPT @", i, "  next token:", tokenizer.decode([labels[i]]), "  nll:", nll[(valid.nonzero().flatten()==i).nonzero(as_tuple=True)[0]].item())
+        print(loss.item())
 
+    # -------------- Validate / Generate --------------
+    if step % 100 == 0:
+        # seed prompt
+        val_ids = input_ids[:3].clone()
 
+        # align to training schedule: if exactly a stride since last ckpt, append one
+        val_ids = maybe_append_ckpt(val_ids, ckpt_id, ckpt_stride)
 
-# build position ids for each docs
+        print("seed:", tokenizer.decode(val_ids.tolist()))
+        print("--------------------------------")
 
-docs = (inputs == tokenizer.eos_token_id).long().cumsum(0)
-unique_docs = docs.unique()
-docs_position_ids = []
-for i in unique_docs:
-    doc_size = (docs == i).sum()
-    print(doc_size)
-    position_ids = torch.arange(doc_size, device="cuda")
-    docs_position_ids.append(position_ids)
-docs_position_ids = torch.cat(docs_position_ids, dim=0)
-print(docs_position_ids.shape)
+        max_new_tokens = 16
+        for _ in range(max_new_tokens):
+            # enforce checkpoint cadence before generating the next token
+            if tokens_since_last_ckpt(val_ids, ckpt_id) >= ckpt_stride:
+                val_ids = torch.cat([val_ids, torch.tensor([ckpt_id], device=val_ids.device)], dim=0)
+                # do not sample a token on this turn; we just inserted a checkpoint
+                continue
 
+            mask, _ = create_attention_mask(
+                val_ids,
+                special_token_ids=special_ids_tensor,
+                checkpoint_id=ckpt_id,
+                eos_token_id=eos_id,
+            )
+            with torch.no_grad():
+                out = model(val_ids.unsqueeze(0), attention_mask=mask)
+                next_id = out.logits[:, -1, :].argmax(dim=-1)
 
-# example of loss
+            val_ids = torch.cat([val_ids, next_id], dim=0)
+            print(tokenizer.decode(val_ids.tolist()))
 
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", device_map="cuda", dtype=torch.bfloat16, attn_implementation="flex_attention")
-print(inputs.shape, labels.shape, docs_position_ids.shape)
-print(inputs.device, labels.device, docs_position_ids.device)
-outputs = model(inputs.unsqueeze(0), attention_mask=mask, labels=labels.unsqueeze(0), position_ids=docs_position_ids.unsqueeze(0))
-
-print(outputs.loss)
+        print("--------------------------------")
