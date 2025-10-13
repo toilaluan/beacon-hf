@@ -1,106 +1,79 @@
-from datasets import load_dataset
-import json
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from __future__ import annotations
+
+from dataclasses import dataclass
+from itertools import islice, repeat
+from typing import Callable, Iterable, Iterator, List, Sequence, Tuple, Dict, Optional
+
 import torch
+from datasets import load_dataset
 from torch.nn.attention import flex_attention
-from typing import Tuple, Callable
-
-def create_attention_mask(
-    ids: torch.Tensor,
-    special_token_ids: torch.Tensor,
-    checkpoint_id: int,
-    eos_token_id: int | None,
-    block_size: int = 128,
-) -> Tuple[flex_attention.BlockMask, Callable[..., bool]]:
-    """
-    Build a causal attention mask that respects checkpoint boundaries.
-
-    Each checkpoint token opens attention across the preceding stride while
-    still allowing access to earlier checkpoints and special tokens.
-    """
-    if ids.ndim != 1:
-        raise ValueError("ids must be a 1D tensor")
-
-    device = ids.device
-    special_token_ids = special_token_ids.to(device)
-
-    is_checkpoint = ids == checkpoint_id
-    is_special = torch.isin(ids, special_token_ids)
-
-    # Beacon groups: each non-checkpoint belongs to the group of the most recent checkpoint (before it)
-    beacon_ids = is_checkpoint.long().cumsum(0) - is_checkpoint.long()
-
-    # Doc groups: if no eos_token_id is provided or it never appears, treat entire seq as one doc
-    if eos_token_id is None or (ids == eos_token_id).sum() == 0:
-        docs = torch.zeros_like(ids)
-    else:
-        docs = (ids == eos_token_id).long().cumsum(0)
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        causal = q_idx >= kv_idx
-        same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
-        same_doc = docs[kv_idx] == docs[q_idx]
-        return causal & same_doc & (same_beacon | is_checkpoint[kv_idx] | is_special[kv_idx])
-
-    block_mask = flex_attention.create_block_mask(
-        mask_mod, B=1, H=1, Q_LEN=ids.numel(), KV_LEN=ids.numel(), BLOCK_SIZE=block_size
-    )
-    return block_mask, mask_mod
-
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-
-# Add checkpoint special token
-tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
-ckpt_id = tokenizer.cls_token_id
-
-# Helpful: define eos if present; else None (single-doc behavior)
-eos_id = tokenizer.eos_token_id
-
-# Encode and insert checkpoints every N tokens (training-style)
-input_text = "capital of france is paris, capital of italy is rome, capital of germany is berlin, capital of vietnam is hanoi"
-ids_plain = tokenizer.encode(input_text)
-ckpt_stride = 8
-updated_ids = []
-for i in range(0, len(ids_plain), ckpt_stride):
-    updated_ids.extend(ids_plain[i:i+ckpt_stride])
-    updated_ids.append(ckpt_id)
-input_ids = torch.tensor(updated_ids, device="cuda")
-
-print(tokenizer.decode(input_ids.tolist()))
-
-# Load model *after* adding special tokens, then resize embeddings
-model = AutoModelForCausalLM.from_pretrained(
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    device_map="cuda",
-    dtype=torch.bfloat16,
-    attn_implementation="flex_attention",
-)
-model.resize_token_embeddings(len(tokenizer))
-
 from torch.optim import AdamW
-optimizer = AdamW(model.parameters(), lr=1e-4)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-train_ids = input_ids[:-1].clone()
-labels    = input_ids[1:].clone()
+# -------------------------
+# Constants & Small Helpers
+# -------------------------
 
-special_ids = set(tokenizer.all_special_ids)
-special_ids.add(ckpt_id)  # ensure our new token is treated as special
-special_ids_tensor = torch.tensor(sorted(special_ids), device="cuda")
+OPTION_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-attn_mask, mask_mod = create_attention_mask(
-    train_ids,
-    special_token_ids=special_ids_tensor,
-    checkpoint_id=ckpt_id,
-    eos_token_id=eos_id,
-)
 
-print(attn_mask)
-print(mask_mod)
+def set_seed(seed: int = 42) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-# ---------- Fixed: generation helpers ----------
+
+# -------------------------
+# Beacon / Checkpoint Logic
+# -------------------------
+
+def insert_checkpoints(token_ids: Sequence[int], stride: int, ckpt_id: int) -> List[int]:
+    """
+    Insert checkpoint tokens every `stride` tokens: [.. stride .. CKPT .. stride .. CKPT ..]
+    """
+    if stride <= 0:
+        return list(token_ids)
+
+    with_ckpts: List[int] = []
+    for start in range(0, len(token_ids), stride):
+        end = min(start + stride, len(token_ids))
+        with_ckpts.extend(token_ids[start:end])
+        if end < len(token_ids):
+            with_ckpts.append(ckpt_id)
+    return with_ckpts
+
+
+def insert_checkpoints_with_labels(
+    token_ids: Sequence[int],
+    labels: Sequence[int],
+    stride: int,
+    ckpt_id: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Insert checkpoint tokens while tracking original label positions.
+
+    labels[i] is a marker for token_ids[i] (e.g., 0=prompt, 1=choice). Checkpoints inherit 0.
+    """
+    if len(token_ids) != len(labels):
+        raise ValueError("token_ids and labels must have the same length")
+    if stride <= 0:
+        return list(token_ids), list(labels)
+
+    out_tokens: List[int] = []
+    out_labels: List[int] = []
+
+    for start in range(0, len(token_ids), stride):
+        end = min(start + stride, len(token_ids))
+        out_tokens.extend(token_ids[start:end])
+        out_labels.extend(labels[start:end])
+        if end < len(token_ids):
+            out_tokens.append(ckpt_id)
+            out_labels.append(0)
+    return out_tokens, out_labels
+
 
 def tokens_since_last_ckpt(seq: torch.Tensor, ckpt_token_id: int) -> int:
-    """Count consecutive non-ckpt tokens from the end back to the most recent ckpt (0 if last is ckpt)."""
+    """Count tokens back from tail to the most recent checkpoint token."""
     n = 0
     for t in range(seq.numel() - 1, -1, -1):
         if int(seq[t].item()) == int(ckpt_token_id):
@@ -108,60 +81,572 @@ def tokens_since_last_ckpt(seq: torch.Tensor, ckpt_token_id: int) -> int:
         n += 1
     return n
 
+
 def maybe_append_ckpt(seq: torch.Tensor, ckpt_token_id: int, stride: int) -> torch.Tensor:
-    """Append a checkpoint if we've already produced `stride` tokens since the last checkpoint."""
+    """Ensure we don't exceed `stride` without a checkpoint."""
     if tokens_since_last_ckpt(seq, ckpt_token_id) >= stride:
         seq = torch.cat([seq, torch.tensor([ckpt_token_id], device=seq.device)], dim=0)
     return seq
 
-# -------------- Train --------------
-for step in range(1000):
-    optimizer.zero_grad()
-    labels[(labels == tokenizer.cls_token_id).nonzero(as_tuple=True)] = -100
-    outputs = model(train_ids.unsqueeze(0), attention_mask=attn_mask)
-    logits = outputs.logits[0] 
-    valid = (labels != -100)
-    nll = torch.nn.functional.cross_entropy(logits[valid], labels[valid], reduction='none')
-    # Print around each checkpoint boundary
-    loss = nll.mean()
-    loss.backward()
-    optimizer.step()
-    if step % 10 == 0:
-        for i, t in enumerate(train_ids[:-1]):
-            if t.item() == ckpt_id and i+1 < labels.numel():
-                print("after CKPT @", i, "  next token:", tokenizer.decode([labels[i]]), "  nll:", nll[(valid.nonzero().flatten()==i).nonzero(as_tuple=True)[0]].item())
-        print(loss.item())
 
-    # -------------- Validate / Generate --------------
-    if step % 100 == 0:
-        # seed prompt
-        val_ids = input_ids[:3].clone()
+# -------------------------
+# Mask & Positions
+# -------------------------
 
-        # align to training schedule: if exactly a stride since last ckpt, append one
-        val_ids = maybe_append_ckpt(val_ids, ckpt_id, ckpt_stride)
+def build_position_ids(ids: torch.Tensor, pad_token_id: Optional[int]) -> torch.Tensor:
+    """
+    Monotonic 0..N per document (docs delimited by pad_token_id). Entire sequence is 1 doc if pad_token_id is None.
+    """
+    if ids.ndim != 1:
+        raise ValueError("ids must be a 1D tensor")
 
-        print("seed:", tokenizer.decode(val_ids.tolist()))
-        print("--------------------------------")
+    if pad_token_id is None or (ids == pad_token_id).sum() == 0:
+        # Single doc: simple arange
+        return torch.arange(ids.numel(), device=ids.device)
 
-        max_new_tokens = 16
-        for _ in range(max_new_tokens):
-            # enforce checkpoint cadence before generating the next token
-            if tokens_since_last_ckpt(val_ids, ckpt_id) >= ckpt_stride:
-                val_ids = torch.cat([val_ids, torch.tensor([ckpt_id], device=val_ids.device)], dim=0)
-                # do not sample a token on this turn; we just inserted a checkpoint
+    docs = (ids == pad_token_id).long().cumsum(0)
+    position_ids = []
+    for doc_id in docs.unique():
+        idxs = (docs == doc_id).nonzero(as_tuple=False).flatten()
+        position_ids.append(torch.arange(idxs.numel(), device=ids.device))
+    return torch.cat(position_ids, dim=0)
+
+
+def create_attention_mask(
+    ids: torch.Tensor,
+    special_token_ids: torch.Tensor,
+    checkpoint_id: int,
+    pad_id: Optional[int],
+    block_size: int = 128,
+) -> Tuple[flex_attention.BlockMask, Callable[..., bool]]:
+    """
+    Causal mask with "beacon groups": each non-checkpoint attends within its most-recent checkpoint span,
+    plus earlier checkpoints and any special tokens. Doc boundaries (pads) isolate attention.
+    """
+    if ids.ndim != 1:
+        raise ValueError("ids must be a 1D tensor")
+
+    device = ids.device
+    special_token_ids = special_token_ids.to(device)
+
+    is_ckpt = ids == checkpoint_id
+    is_special = torch.isin(ids, special_token_ids)
+
+    # "Beacon group" index for each position: cumsum over checkpoints, but exclude self if checkpoint.
+    beacon_ids = is_ckpt.long().cumsum(0) - is_ckpt.long()
+
+    # Document groups via pad delimiter (or single doc)
+    if pad_id is None or (ids == pad_id).sum() == 0:
+        docs = torch.zeros_like(ids)
+    else:
+        docs = (ids == pad_id).long().cumsum(0)
+
+    def mask_mod(_b, _h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        same_doc = docs[kv_idx] == docs[q_idx]
+        same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
+        return causal & same_doc & (same_beacon | is_ckpt[kv_idx] | is_special[kv_idx])
+
+    block_mask = flex_attention.create_block_mask(
+        mask_mod, B=1, H=1, Q_LEN=ids.numel(), KV_LEN=ids.numel(), BLOCK_SIZE=block_size
+    )
+    return block_mask, mask_mod
+
+
+# -------------------------
+# Tokenization & Streaming
+# -------------------------
+
+def format_mmlu_prompt(question: str, choices: Sequence[str]) -> str:
+    lines = [question.strip()]
+    for label, choice in zip(OPTION_LABELS, choices):
+        lines.append(f"{label}. {choice.strip()}")
+    lines.append("Answer:")
+    return "\n".join(lines)
+
+
+def stream_token_chunks(
+    dataset: Iterable[dict],
+    tokenizer: AutoTokenizer,
+    ckpt_stride: int,
+    ckpt_id: int,
+    pad_id: int,
+    max_tokens: int,
+) -> Iterator[List[int]]:
+    """
+    Stream text→tokens→insert checkpoints, append `pad_id` as a doc delimiter, and yield fixed-size chunks.
+    """
+    buffer: List[int] = []
+    for example in dataset:
+        text = example.get("text")
+        if not text:
+            continue
+
+        tokens = tokenizer.encode(text, add_special_tokens=True)
+        if not tokens:
+            continue
+
+        tokens = insert_checkpoints(tokens, ckpt_stride, ckpt_id)
+        buffer.extend(tokens)
+        buffer.append(pad_id)
+
+        if len(buffer) >= max_tokens + 1:
+            yield buffer[: max_tokens + 1]
+            buffer = []
+
+
+# -------------------------
+# Config
+# -------------------------
+
+@dataclass
+class TrainConfig:
+    model_name: str = "Qwen/Qwen2.5-0.5B"
+    dataset_name: str = "HuggingFaceFW/fineweb"
+    max_steps: int = 10000
+    max_tokens: int = 4096
+    ckpt_stride: int = 8
+    lr: float = 1e-4
+    log_interval: int = 10
+    eval_interval: int = 100
+    block_size: int = 128
+    max_new_tokens: int = 32
+    fixed_prompt: str = "capital of india is new delhi, capital of america is"
+    fixed_training_prompt: str = (
+        "capital of india is new delhi, capital of america is washington d.c., capital of canada is ottawa."
+    )
+    is_overfit: bool = False
+    shuffle_buffer: int = 10_000
+    # MMLU
+    mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy",)
+    mmlu_split: str = "validation"
+    mmlu_max_samples: int = 25
+    mmlu_eval_interval: int = 100
+    seed: int = 42
+
+
+# -------------------------
+# Init (Model/Tokenizer/Device)
+# -------------------------
+
+def resolve_runtime_device() -> Tuple[torch.device, Optional[str], torch.dtype]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_map = "cuda" if device.type == "cuda" else None
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    return device, device_map, dtype
+
+
+def initialize_tokenizer(
+    config: TrainConfig, device: torch.device
+) -> Tuple[AutoTokenizer, int, Optional[int], torch.Tensor]:
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
+    tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    ckpt_id = tokenizer.cls_token_id
+    pad_id = tokenizer.pad_token_id
+
+    special_ids = set(tokenizer.all_special_ids)
+    special_ids.add(ckpt_id)
+    special_ids_tensor = torch.tensor(sorted(special_ids), device=device)
+    return tokenizer, ckpt_id, pad_id, special_ids_tensor
+
+
+def initialize_model(
+    config: TrainConfig,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    device_map: Optional[str],
+    dtype: torch.dtype,
+) -> AutoModelForCausalLM:
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        device_map=device_map,
+        attn_implementation="flex_attention",
+        torch_dtype=dtype,
+    )
+    if device_map is None:
+        model.to(device)
+
+    model.resize_token_embeddings(len(tokenizer))
+    model.train()
+    # model = torch.compile(model)
+    return model
+
+
+def create_token_stream(
+    config: TrainConfig,
+    tokenizer: AutoTokenizer,
+    ckpt_id: int,
+    pad_id: Optional[int],
+) -> Iterable[List[int]]:
+    if config.is_overfit:
+        ids = tokenizer.encode(config.fixed_training_prompt, add_special_tokens=False)
+        ids = insert_checkpoints(ids, config.ckpt_stride, ckpt_id)
+        if pad_id is not None:
+            ids = ids + [pad_id]
+        print("Overfit sample:", tokenizer.decode(ids))
+        return repeat(ids, times=config.max_steps)
+
+    dataset = load_dataset(config.dataset_name, split="train", streaming=True)
+    dataset = dataset.shuffle(buffer_size=config.shuffle_buffer, seed=config.seed)
+    assert pad_id is not None, "pad_id must not be None when streaming"
+    return stream_token_chunks(
+        dataset,
+        tokenizer,
+        ckpt_stride=config.ckpt_stride,
+        ckpt_id=ckpt_id,
+        pad_id=pad_id,
+        max_tokens=config.max_tokens,
+    )
+
+
+# -------------------------
+# Batch Prep & Generation
+# -------------------------
+
+def prepare_batch(
+    chunk: List[int],
+    device: torch.device,
+    ckpt_id: int,
+    special_ids_tensor: torch.Tensor,
+    pad_id: Optional[int],
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, flex_attention.BlockMask, Callable[..., bool], torch.Tensor]:
+    """
+    Convert a token chunk into training tensors (input_ids, labels, block mask, mask fn, position_ids).
+    """
+    full_ids = torch.tensor(chunk, device=device)
+    train_ids = full_ids[:-1]
+    labels = full_ids[1:].clone()
+
+    # Ignore loss on special tokens
+    labels[labels == ckpt_id] = -100
+    if pad_id is not None:
+        labels[labels == pad_id] = -100
+
+    # Positions are per-doc (using pad delimiters), shifted to align with input_ids
+    position_ids = build_position_ids(full_ids, pad_id)[:-1]
+
+    attn_mask, mask_mod = create_attention_mask(
+        train_ids,
+        special_token_ids=special_ids_tensor,
+        checkpoint_id=ckpt_id,
+        pad_id=pad_id,
+        block_size=block_size,
+    )
+    return train_ids, labels, attn_mask, mask_mod, position_ids
+
+
+@torch.inference_mode()
+def generate_sample(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    device: torch.device,
+    ckpt_id: int,
+    ckpt_stride: int,
+    special_ids_tensor: torch.Tensor,
+    pad_id: Optional[int],
+    max_new_tokens: int,
+    block_size: int,
+) -> str:
+    """
+    Greedy decode with the same beacon-aware attention mask as training.
+    """
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    if not prompt_tokens:
+        return ""
+
+    prompt_tokens = insert_checkpoints(prompt_tokens, ckpt_stride, ckpt_id)
+    val_ids = torch.tensor(prompt_tokens, device=device)
+    val_ids = maybe_append_ckpt(val_ids, ckpt_id, ckpt_stride)
+
+    for _ in range(max_new_tokens):
+        # Ensure stride constraint
+        if tokens_since_last_ckpt(val_ids, ckpt_id) >= ckpt_stride:
+            val_ids = torch.cat([val_ids, torch.tensor([ckpt_id], device=device)], dim=0)
+            continue
+
+        # Recompute mask on growth
+        pos_ids = build_position_ids(val_ids, pad_id)
+        attn_mask, _ = create_attention_mask(
+            val_ids,
+            special_token_ids=special_ids_tensor,
+            checkpoint_id=ckpt_id,
+            pad_id=pad_id,
+            block_size=block_size,
+        )
+        logits = model(
+            val_ids.unsqueeze(0), attention_mask=attn_mask, position_ids=pos_ids.unsqueeze(0)
+        ).logits[:, -1, :]
+        next_id = logits.argmax(dim=-1)
+        val_ids = torch.cat([val_ids, next_id], dim=0)
+
+    return tokenizer.decode(val_ids.tolist())
+
+
+# -------------------------
+# Evaluation (MMLU)
+# -------------------------
+
+def _choice_logprob_sum(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    base_prompt: str,
+    completion: str,
+    ckpt_id: int,
+    pad_id: Optional[int],
+    ckpt_stride: int,
+    block_size: int,
+    special_ids_tensor: torch.Tensor,
+) -> float:
+    tokens_prompt = tokenizer.encode(base_prompt, add_special_tokens=False)
+    tokens_choice = tokenizer.encode(completion, add_special_tokens=False)
+    seq = tokens_prompt + tokens_choice
+    labels = [0] * len(tokens_prompt) + [1] * len(tokens_choice)
+
+    seq, labels = insert_checkpoints_with_labels(seq, labels, stride=ckpt_stride, ckpt_id=ckpt_id)
+    if len(seq) < 2:
+        return float("-inf")
+
+    seq_t = torch.tensor(seq, device=device)
+    input_ids = seq_t[:-1]
+    target_ids = seq_t[1:]
+    pos_ids = build_position_ids(seq_t, pad_id)[:-1]
+
+    attn_mask, _ = create_attention_mask(
+        input_ids, special_token_ids=special_ids_tensor, checkpoint_id=ckpt_id, pad_id=pad_id, block_size=block_size
+    )
+    with torch.inference_mode():
+        logits = model(input_ids.unsqueeze(0), attention_mask=attn_mask, position_ids=pos_ids.unsqueeze(0)).logits[0]
+        logp = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    choice_positions = [i for i, lab in enumerate(labels[1:]) if lab == 1]
+    if not choice_positions:
+        return float("-inf")
+
+    targets = target_ids[choice_positions]
+    token_scores = logp[choice_positions, targets]
+    return float(token_scores.sum().item())
+
+
+@torch.inference_mode()
+def evaluate_mmlu(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    config: TrainConfig,
+    ckpt_id: int,
+    pad_id: Optional[int],
+    special_ids_tensor: torch.Tensor,
+) -> Tuple[float, Dict[str, float]]:
+    if not config.mmlu_subjects:
+        return 0.0, {}
+
+    was_training = model.training
+    model.eval()
+
+    overall_correct = 0
+    overall_total = 0
+    subject_scores: Dict[str, float] = {}
+
+    for subject in config.mmlu_subjects:
+        try:
+            ds = load_dataset("cais/mmlu", subject, split=config.mmlu_split)
+        except Exception as exc:
+            print(f"[MMLU] Failed to load subject '{subject}': {exc}")
+            subject_scores[subject] = 0.0
+            continue
+
+        subject_correct = 0
+        subject_total = 0
+
+        for idx, example in enumerate(islice(ds, config.mmlu_max_samples)):
+            question = example.get("question", "")
+            choices = example.get("choices") or example.get("options")
+            answer = example.get("answer")
+
+            if not question or not choices or answer is None:
                 continue
 
-            mask, _ = create_attention_mask(
-                val_ids,
-                special_token_ids=special_ids_tensor,
-                checkpoint_id=ckpt_id,
-                eos_token_id=eos_id,
+            prompt = format_mmlu_prompt(question, choices)
+
+            # Score each option completion " A", " B", ...
+            scores: List[float] = []
+            for j in range(min(len(choices), len(OPTION_LABELS))):
+                letter = OPTION_LABELS[j]
+                completion = f" {letter}"
+                scores.append(
+                    _choice_logprob_sum(
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device,
+                        base_prompt=prompt,
+                        completion=completion,
+                        ckpt_id=ckpt_id,
+                        pad_id=pad_id,
+                        ckpt_stride=config.ckpt_stride,
+                        block_size=config.block_size,
+                        special_ids_tensor=special_ids_tensor,
+                    )
+                )
+
+            if not scores:
+                continue
+
+            pred_idx = max(range(len(scores)), key=scores.__getitem__)
+
+            if isinstance(answer, str):
+                ans_clean = answer.strip().upper()
+                if not ans_clean:
+                    continue
+                ans_letter = ans_clean[0]
+                if ans_letter not in OPTION_LABELS:
+                    continue
+                answer_idx = OPTION_LABELS.index(ans_letter)
+            else:
+                try:
+                    answer_idx = int(answer)
+                except (TypeError, ValueError):
+                    continue
+
+            subject_total += 1
+            if pred_idx == answer_idx:
+                subject_correct += 1
+
+        subject_scores[subject] = (subject_correct / subject_total) if subject_total else 0.0
+        overall_correct += subject_correct
+        overall_total += subject_total
+
+    if was_training:
+        model.train()
+
+    overall_score = overall_correct / overall_total if overall_total else 0.0
+    return overall_score, subject_scores
+
+
+# -------------------------
+# Training Loop
+# -------------------------
+
+def train_model(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    optimizer: AdamW,
+    token_stream: Iterable[List[int]],
+    config: TrainConfig,
+    *,
+    device: torch.device,
+    ckpt_id: int,
+    pad_id: Optional[int],
+    special_ids_tensor: torch.Tensor,
+) -> None:
+    running_ema = 0.0
+    ema_beta = 0.9
+    visualized = False
+
+    for step, chunk in enumerate(islice(token_stream, config.max_steps), start=1):
+        input_ids, labels, attn_mask, mask_mod, position_ids = prepare_batch(
+            chunk,
+            device=device,
+            ckpt_id=ckpt_id,
+            special_ids_tensor=special_ids_tensor,
+            pad_id=pad_id,
+            block_size=config.block_size,
+        )
+
+        # Optional one-time visualization (if user has a visualize module)
+        if not visualized:
+            try:
+                from visualize import visualize_attention_scores  # pragma: no cover
+                q = torch.zeros((1, 1, len(input_ids), 4), device=device)
+                k = torch.zeros((1, 1, len(input_ids), 4), device=device)
+                visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
+            except Exception:
+                pass
+            visualized = True
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(
+            input_ids.unsqueeze(0),
+            attention_mask=attn_mask,
+            position_ids=position_ids.unsqueeze(0),
+        ).logits[0]
+
+        valid = labels != -100
+        if not valid.any():
+            continue
+
+        loss = torch.nn.functional.cross_entropy(logits[valid], labels[valid])
+        loss.backward()
+        optimizer.step()
+
+        loss_val = float(loss.item())
+        running_ema = loss_val if step == 1 else (running_ema * ema_beta + loss_val * (1 - ema_beta))
+
+        if step % config.log_interval == 0 or step == 1:
+            print(f"[step {step}] loss={loss_val:.4f} ema={running_ema:.4f}")
+
+        if step % config.eval_interval == 0:
+            sample = generate_sample(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=config.fixed_prompt,
+                device=device,
+                ckpt_id=ckpt_id,
+                ckpt_stride=config.ckpt_stride,
+                special_ids_tensor=special_ids_tensor,
+                pad_id=pad_id,
+                max_new_tokens=config.max_new_tokens,
+                block_size=config.block_size,
             )
-            with torch.no_grad():
-                out = model(val_ids.unsqueeze(0), attention_mask=mask)
-                next_id = out.logits[:, -1, :].argmax(dim=-1)
+            print("----- sample -----")
+            print(sample)
+            print("------------------")
 
-            val_ids = torch.cat([val_ids, next_id], dim=0)
-            print(tokenizer.decode(val_ids.tolist()))
+        if config.mmlu_subjects and step % config.mmlu_eval_interval == 0:
+            overall, per_subject = evaluate_mmlu(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                config=config,
+                ckpt_id=ckpt_id,
+                pad_id=pad_id,
+                special_ids_tensor=special_ids_tensor,
+            )
+            print(f"[step {step}] mmlu_overall={overall:.4f}")
+            for subject, score in per_subject.items():
+                print(f"  {subject}: {score:.4f}")
 
-        print("--------------------------------")
+
+# -------------------------
+# Entry
+# -------------------------
+
+def main():
+    config = TrainConfig()
+    set_seed(config.seed)
+
+    device, device_map, dtype = resolve_runtime_device()
+    tokenizer, ckpt_id, pad_id, special_ids_tensor = initialize_tokenizer(config, device)
+    model = initialize_model(config=config, tokenizer=tokenizer, device=device, device_map=device_map, dtype=dtype)
+    optimizer = AdamW(model.parameters(), lr=config.lr)
+
+    token_stream = create_token_stream(config=config, tokenizer=tokenizer, ckpt_id=ckpt_id, pad_id=pad_id)
+    train_model(
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        token_stream=token_stream,
+        config=config,
+        device=device,
+        ckpt_id=ckpt_id,
+        pad_id=pad_id,
+        special_ids_tensor=special_ids_tensor,
+    )
+
+
+if __name__ == "__main__":
+    main()
