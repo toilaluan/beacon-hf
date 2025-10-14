@@ -137,18 +137,19 @@ def create_attention_mask(
 
     # "Beacon group" index for each position: cumsum over checkpoints, but exclude self if checkpoint.
     beacon_ids = is_ckpt.long().cumsum(0) - is_ckpt.long()
+    is_pads = ids == pad_id
 
     # Document groups via pad delimiter (or single doc)
     if pad_id is None or (ids == pad_id).sum() == 0:
         docs = torch.zeros_like(ids)
     else:
-        docs = (ids == pad_id).long().cumsum(0)
+        docs = is_pads.long().cumsum(0) - is_pads.long()
 
     def ckpt_mod(_b, _h, q_idx, kv_idx):
         causal = q_idx >= kv_idx
         same_doc = docs[kv_idx] == docs[q_idx]
         same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
-        return causal & same_doc & (same_beacon | is_ckpt[kv_idx])
+        return causal & same_doc & (same_beacon | is_ckpt[kv_idx]) & ~is_pads[q_idx]
 
     def causal_mod(_b, _h, q_idx, kv_idx):
         same_doc = docs[kv_idx] == docs[q_idx]
@@ -178,52 +179,21 @@ def format_mmlu_prompt(question: str, choices: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def stream_token_chunks(
-    dataset: Iterable[dict],
-    tokenizer: AutoTokenizer,
-    ckpt_stride: int,
-    ckpt_id: int,
-    pad_id: int,
-    max_tokens: int,
-    use_ckpt: bool,
-) -> Iterator[List[int]]:
-    """
-    Stream text→tokens→insert checkpoints, append `pad_id` as a doc delimiter, and yield fixed-size chunks.
-    """
-    buffer: List[int] = []
-    for example in dataset:
-        text = example.get("text")
-        if not text:
-            continue
-
-        tokens = tokenizer.encode(text, add_special_tokens=True)
-        if not tokens:
-            continue
-        if use_ckpt:
-            tokens = insert_checkpoints(tokens, ckpt_stride, ckpt_id)
-        buffer.extend(tokens)
-        buffer.append(pad_id)
-
-        if len(buffer) >= max_tokens + 1:
-            yield buffer[: max_tokens + 1]
-            buffer = []
-
-
 # -------------------------
 # Config
 # -------------------------
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-1.5B"
+    model_name: str = "Qwen/Qwen2.5-0.5B"
     dataset_name: str = "HuggingFaceFW/finepdfs"
     max_steps: int = 100000
-    max_tokens: int = 8192*4
+    max_tokens: int = 256
     use_ckpt: bool = True
     ckpt_stride: int = 16
     lr: float = 1e-4
     log_interval: int = 10
-    eval_interval: int = 2000
+    eval_interval: int = 100
     block_size: int = 128
     max_new_tokens: int = 32
     fixed_prompt: str = "list of all capitals: capital of india is new delhi, capital of america is"
@@ -286,38 +256,8 @@ def initialize_model(
 
     model.resize_token_embeddings(len(tokenizer))
     model.train()
-    model = torch.compile(model)
+    # model = torch.compile(model)
     return model
-
-
-def create_token_stream(
-    config: TrainConfig,
-    tokenizer: AutoTokenizer,
-    ckpt_id: int,
-    pad_id: Optional[int],
-) -> Iterable[List[int]]:
-    if config.is_overfit:
-        ids = tokenizer.encode(config.fixed_training_prompt, add_special_tokens=False)
-        if config.use_ckpt:
-            ids = insert_checkpoints(ids, config.ckpt_stride, ckpt_id)
-        if pad_id is not None:
-            ids = ids + [pad_id]
-        print("Overfit sample:", tokenizer.decode(ids))
-        return repeat(ids, times=config.max_steps)
-
-    dataset = load_dataset(config.dataset_name, split="train", streaming=True)
-    dataset = dataset.shuffle(buffer_size=config.shuffle_buffer, seed=config.seed)
-    assert pad_id is not None, "pad_id must not be None when streaming"
-    return stream_token_chunks(
-        dataset,
-        tokenizer,
-        ckpt_stride=config.ckpt_stride,
-        ckpt_id=ckpt_id,
-        pad_id=pad_id,
-        max_tokens=config.max_tokens,
-        use_ckpt=config.use_ckpt,
-    )
-
 
 # -------------------------
 # Batch Prep & Generation
@@ -635,20 +575,20 @@ def train_model(
             print(sample)
             print("------------------")
 
-        if config.mmlu_subjects and step % config.mmlu_eval_interval == 0:
-            overall, per_subject = evaluate_mmlu(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                config=config,
-                ckpt_id=ckpt_id,
-                pad_id=pad_id,
-                special_ids_tensor=special_ids_tensor,
-                use_ckpt=config.use_ckpt,
-            )
-            print(f"[step {step}] mmlu_overall={overall:.4f}")
-            for subject, score in per_subject.items():
-                print(f"  {subject}: {score:.4f}")
+        # if config.mmlu_subjects and step % config.mmlu_eval_interval == 0:
+        #     overall, per_subject = evaluate_mmlu(
+        #         model=model,
+        #         tokenizer=tokenizer,
+        #         device=device,
+        #         config=config,
+        #         ckpt_id=ckpt_id,
+        #         pad_id=pad_id,
+        #         special_ids_tensor=special_ids_tensor,
+        #         use_ckpt=config.use_ckpt,
+        #     )
+        #     print(f"[step {step}] mmlu_overall={overall:.4f}")
+        #     for subject, score in per_subject.items():
+        #         print(f"  {subject}: {score:.4f}")
 
 
 # -------------------------
@@ -664,25 +604,34 @@ def main():
     model = initialize_model(config=config, tokenizer=tokenizer, device=device, device_map=device_map, dtype=dtype)
     optimizer = AdamW(model.parameters(), lr=config.lr)
 
-    # token_stream = create_token_stream(config=config, tokenizer=tokenizer, ckpt_id=ckpt_id, pad_id=pad_id)
-    dataset = DistributedTokenDataset(
-        dataset_path=Path("tokenized_data"),
-        sequence_length=config.max_tokens,
-        ckpt_id=ckpt_id,
-        ckpt_stride=config.ckpt_stride,
-        local_rank=0,
-        world_size=1,
-        base_seed=config.seed,
-    )
-    from torch.utils.data import DataLoader
+    if not config.is_overfit:
+        dataset = DistributedTokenDataset(
+            dataset_path=Path("tokenized_data"),
+            sequence_length=config.max_tokens,
+            ckpt_id=ckpt_id,
+            ckpt_stride=config.ckpt_stride,
+            local_rank=0,
+            world_size=1,
+            base_seed=config.seed,
+        )
+        from torch.utils.data import DataLoader
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=1,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+        )
+    else:
+        test_ids = tokenizer.encode(config.fixed_training_prompt, add_special_tokens=False)
+        test_ids = insert_checkpoints(test_ids, config.ckpt_stride, ckpt_id)
+        test_ids = torch.tensor(test_ids, device=device)
+        test_ids = torch.cat([test_ids, torch.tensor([pad_id], device=device), test_ids, torch.tensor([pad_id], device=device)])
+        dataloader = [(test_ids,)]
+        from itertools import cycle
+        dataloader = cycle(dataloader)
+
     print(next(iter(dataloader))[0].shape)
     train_model(
         model=model,
