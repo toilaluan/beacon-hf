@@ -48,6 +48,7 @@ def insert_checkpoints_with_labels(
     labels: Sequence[int],
     stride: int,
     ckpt_id: int,
+    use_ckpt: bool,
 ) -> Tuple[List[int], List[int]]:
     """
     Insert checkpoint tokens while tracking original label positions.
@@ -66,7 +67,7 @@ def insert_checkpoints_with_labels(
         end = min(start + stride, len(token_ids))
         out_tokens.extend(token_ids[start:end])
         out_labels.extend(labels[start:end])
-        if end < len(token_ids):
+        if end < len(token_ids) and use_ckpt:
             out_tokens.append(ckpt_id)
             out_labels.append(0)
     return out_tokens, out_labels
@@ -117,6 +118,7 @@ def create_attention_mask(
     special_token_ids: torch.Tensor,
     checkpoint_id: int,
     pad_id: Optional[int],
+    use_ckpt: bool,
     block_size: int = 128,
 ) -> Tuple[flex_attention.BlockMask, Callable[..., bool]]:
     """
@@ -141,11 +143,21 @@ def create_attention_mask(
     else:
         docs = (ids == pad_id).long().cumsum(0)
 
-    def mask_mod(_b, _h, q_idx, kv_idx):
+    def ckpt_mod(_b, _h, q_idx, kv_idx):
         causal = q_idx >= kv_idx
         same_doc = docs[kv_idx] == docs[q_idx]
         same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
         return causal & same_doc & (same_beacon | is_ckpt[kv_idx] | is_special[kv_idx])
+
+    def causal_mod(_b, _h, q_idx, kv_idx):
+        same_doc = docs[kv_idx] == docs[q_idx]
+        causal = q_idx >= kv_idx
+        return causal & same_doc
+
+    if use_ckpt:
+        mask_mod = ckpt_mod
+    else:
+        mask_mod = causal_mod
 
     block_mask = flex_attention.create_block_mask(
         mask_mod, B=1, H=1, Q_LEN=ids.numel(), KV_LEN=ids.numel(), BLOCK_SIZE=block_size
@@ -172,6 +184,7 @@ def stream_token_chunks(
     ckpt_id: int,
     pad_id: int,
     max_tokens: int,
+    use_ckpt: bool,
 ) -> Iterator[List[int]]:
     """
     Stream text→tokens→insert checkpoints, append `pad_id` as a doc delimiter, and yield fixed-size chunks.
@@ -185,8 +198,8 @@ def stream_token_chunks(
         tokens = tokenizer.encode(text, add_special_tokens=True)
         if not tokens:
             continue
-
-        tokens = insert_checkpoints(tokens, ckpt_stride, ckpt_id)
+        if use_ckpt:
+            tokens = insert_checkpoints(tokens, ckpt_stride, ckpt_id)
         buffer.extend(tokens)
         buffer.append(pad_id)
 
@@ -201,12 +214,13 @@ def stream_token_chunks(
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B"
+    model_name: str = "Qwen/Qwen2.5-1.5B"
     dataset_name: str = "HuggingFaceFW/fineweb"
     max_steps: int = 10000
-    max_tokens: int = 4096
+    max_tokens: int = 128
+    use_ckpt: bool = False
     ckpt_stride: int = 8
-    lr: float = 1e-4
+    lr: float = 1e-5
     log_interval: int = 10
     eval_interval: int = 100
     block_size: int = 128
@@ -218,7 +232,7 @@ class TrainConfig:
     is_overfit: bool = False
     shuffle_buffer: int = 10_000
     # MMLU
-    mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy",)
+    mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy", "formal_logic", "high_school_physics")
     mmlu_split: str = "validation"
     mmlu_max_samples: int = 25
     mmlu_eval_interval: int = 100
@@ -282,7 +296,8 @@ def create_token_stream(
 ) -> Iterable[List[int]]:
     if config.is_overfit:
         ids = tokenizer.encode(config.fixed_training_prompt, add_special_tokens=False)
-        ids = insert_checkpoints(ids, config.ckpt_stride, ckpt_id)
+        if config.use_ckpt:
+            ids = insert_checkpoints(ids, config.ckpt_stride, ckpt_id)
         if pad_id is not None:
             ids = ids + [pad_id]
         print("Overfit sample:", tokenizer.decode(ids))
@@ -298,6 +313,7 @@ def create_token_stream(
         ckpt_id=ckpt_id,
         pad_id=pad_id,
         max_tokens=config.max_tokens,
+        use_ckpt=config.use_ckpt,
     )
 
 
@@ -312,6 +328,7 @@ def prepare_batch(
     special_ids_tensor: torch.Tensor,
     pad_id: Optional[int],
     block_size: int,
+    use_ckpt: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, flex_attention.BlockMask, Callable[..., bool], torch.Tensor]:
     """
     Convert a token chunk into training tensors (input_ids, labels, block mask, mask fn, position_ids).
@@ -334,6 +351,7 @@ def prepare_batch(
         checkpoint_id=ckpt_id,
         pad_id=pad_id,
         block_size=block_size,
+        use_ckpt=use_ckpt,
     )
     return train_ids, labels, attn_mask, mask_mod, position_ids
 
@@ -350,6 +368,7 @@ def generate_sample(
     pad_id: Optional[int],
     max_new_tokens: int,
     block_size: int,
+    use_ckpt: bool,
 ) -> str:
     """
     Greedy decode with the same beacon-aware attention mask as training.
@@ -358,13 +377,15 @@ def generate_sample(
     if not prompt_tokens:
         return ""
 
-    prompt_tokens = insert_checkpoints(prompt_tokens, ckpt_stride, ckpt_id)
+    if use_ckpt:
+        prompt_tokens = insert_checkpoints(prompt_tokens, ckpt_stride, ckpt_id)
     val_ids = torch.tensor(prompt_tokens, device=device)
-    val_ids = maybe_append_ckpt(val_ids, ckpt_id, ckpt_stride)
+    if use_ckpt:
+        val_ids = maybe_append_ckpt(val_ids, ckpt_id, ckpt_stride)
 
     for _ in range(max_new_tokens):
         # Ensure stride constraint
-        if tokens_since_last_ckpt(val_ids, ckpt_id) >= ckpt_stride:
+        if use_ckpt and tokens_since_last_ckpt(val_ids, ckpt_id) >= ckpt_stride:
             val_ids = torch.cat([val_ids, torch.tensor([ckpt_id], device=device)], dim=0)
             continue
 
@@ -376,6 +397,7 @@ def generate_sample(
             checkpoint_id=ckpt_id,
             pad_id=pad_id,
             block_size=block_size,
+            use_ckpt=use_ckpt,
         )
         logits = model(
             val_ids.unsqueeze(0), attention_mask=attn_mask, position_ids=pos_ids.unsqueeze(0)
@@ -401,13 +423,14 @@ def _choice_logprob_sum(
     ckpt_stride: int,
     block_size: int,
     special_ids_tensor: torch.Tensor,
+    use_ckpt: bool,
 ) -> float:
     tokens_prompt = tokenizer.encode(base_prompt, add_special_tokens=False)
     tokens_choice = tokenizer.encode(completion, add_special_tokens=False)
     seq = tokens_prompt + tokens_choice
     labels = [0] * len(tokens_prompt) + [1] * len(tokens_choice)
 
-    seq, labels = insert_checkpoints_with_labels(seq, labels, stride=ckpt_stride, ckpt_id=ckpt_id)
+    seq, labels = insert_checkpoints_with_labels(seq, labels, stride=ckpt_stride, ckpt_id=ckpt_id, use_ckpt=use_ckpt)
     if len(seq) < 2:
         return float("-inf")
 
@@ -417,7 +440,7 @@ def _choice_logprob_sum(
     pos_ids = build_position_ids(seq_t, pad_id)[:-1]
 
     attn_mask, _ = create_attention_mask(
-        input_ids, special_token_ids=special_ids_tensor, checkpoint_id=ckpt_id, pad_id=pad_id, block_size=block_size
+        input_ids, special_token_ids=special_ids_tensor, checkpoint_id=ckpt_id, pad_id=pad_id, block_size=block_size, use_ckpt=use_ckpt
     )
     with torch.inference_mode():
         logits = model(input_ids.unsqueeze(0), attention_mask=attn_mask, position_ids=pos_ids.unsqueeze(0)).logits[0]
@@ -441,6 +464,7 @@ def evaluate_mmlu(
     ckpt_id: int,
     pad_id: Optional[int],
     special_ids_tensor: torch.Tensor,
+    use_ckpt: bool,
 ) -> Tuple[float, Dict[str, float]]:
     if not config.mmlu_subjects:
         return 0.0, {}
@@ -490,6 +514,7 @@ def evaluate_mmlu(
                         ckpt_stride=config.ckpt_stride,
                         block_size=config.block_size,
                         special_ids_tensor=special_ids_tensor,
+                        use_ckpt=config.use_ckpt,
                     )
                 )
 
@@ -542,6 +567,7 @@ def train_model(
     ckpt_id: int,
     pad_id: Optional[int],
     special_ids_tensor: torch.Tensor,
+    use_ckpt: bool,
 ) -> None:
     running_ema = 0.0
     ema_beta = 0.9
@@ -555,11 +581,13 @@ def train_model(
             special_ids_tensor=special_ids_tensor,
             pad_id=pad_id,
             block_size=config.block_size,
+            use_ckpt=use_ckpt,
         )
 
         # Optional one-time visualization (if user has a visualize module)
         if not visualized:
             try:
+                print(f"Input IDs sample: {tokenizer.decode(input_ids.tolist())}")
                 from visualize import visualize_attention_scores  # pragma: no cover
                 q = torch.zeros((1, 1, len(input_ids), 4), device=device)
                 k = torch.zeros((1, 1, len(input_ids), 4), device=device)
@@ -601,6 +629,7 @@ def train_model(
                 pad_id=pad_id,
                 max_new_tokens=config.max_new_tokens,
                 block_size=config.block_size,
+                use_ckpt=config.use_ckpt,
             )
             print("----- sample -----")
             print(sample)
@@ -615,6 +644,7 @@ def train_model(
                 ckpt_id=ckpt_id,
                 pad_id=pad_id,
                 special_ids_tensor=special_ids_tensor,
+                use_ckpt=config.use_ckpt,
             )
             print(f"[step {step}] mmlu_overall={overall:.4f}")
             for subject, score in per_subject.items():
@@ -645,6 +675,7 @@ def main():
         ckpt_id=ckpt_id,
         pad_id=pad_id,
         special_ids_tensor=special_ids_tensor,
+        use_ckpt=config.use_ckpt,
     )
 
 
