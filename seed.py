@@ -10,6 +10,12 @@ from torch.nn.attention import flex_attention
 from torch.optim import AdamW
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from dist_dataloader import DistributedTokenDataset
+from muon import MuonWithAuxAdam
+import wandb
+import time
+
+
+wandb.init(project="ckpt-llm")
 # -------------------------
 # Constants & Small Helpers
 # -------------------------
@@ -185,15 +191,15 @@ def format_mmlu_prompt(question: str, choices: Sequence[str]) -> str:
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B"
+    model_name: str = "meta-llama/Llama-3.2-1B"
     dataset_name: str = "HuggingFaceFW/finepdfs"
     max_steps: int = 100000
-    max_tokens: int = 256
+    max_tokens: int = 1024*12
     use_ckpt: bool = True
     ckpt_stride: int = 16
     lr: float = 1e-4
     log_interval: int = 10
-    eval_interval: int = 100
+    eval_interval: int = 500
     block_size: int = 128
     max_new_tokens: int = 32
     fixed_prompt: str = "list of all capitals: capital of india is new delhi, capital of america is"
@@ -203,10 +209,10 @@ class TrainConfig:
     is_overfit: bool = False
     shuffle_buffer: int = 10_000
     # MMLU
-    mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy", "formal_logic", "high_school_physics")
+    mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy", "formal_logic", "high_school_physics", "high_school_government_and_politics", "international_law", "machine_learning")
     mmlu_split: str = "validation"
     mmlu_max_samples: int = 25
-    mmlu_eval_interval: int = 2000
+    mmlu_eval_interval: int = 500
     seed: int = 42
 
 
@@ -275,9 +281,9 @@ def prepare_batch(
     """
     Convert a token chunk into training tensors (input_ids, labels, block mask, mask fn, position_ids).
     """
-    full_ids = torch.tensor(chunk, device=device)
-    train_ids = full_ids[:-1]
-    labels = full_ids[1:].clone()
+    full_ids = torch.tensor(chunk)
+    train_ids = full_ids[:-1].to(device, non_blocking=True)
+    labels = full_ids[1:].clone().to(device, non_blocking=True)
 
     # Ignore loss on special tokens
     labels[labels == ckpt_id] = -100
@@ -285,7 +291,7 @@ def prepare_batch(
         labels[labels == pad_id] = -100
 
     # Positions are per-doc (using pad delimiters), shifted to align with input_ids
-    position_ids = build_position_ids(full_ids, pad_id)[:-1]
+    position_ids = build_position_ids(full_ids, pad_id)[:-1].to(device, non_blocking=True)
 
     attn_mask, mask_mod = create_attention_mask(
         train_ids,
@@ -317,6 +323,7 @@ def generate_sample(
     """
     model.eval()
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt_tokens = [tokenizer.bos_token_id] + prompt_tokens
     if not prompt_tokens:
         return ""
 
@@ -370,6 +377,8 @@ def _choice_logprob_sum(
 ) -> float:
     tokens_prompt = tokenizer.encode(base_prompt, add_special_tokens=False)
     tokens_choice = tokenizer.encode(completion, add_special_tokens=False)
+    tokens_prompt = [tokenizer.bos_token_id] + tokens_prompt
+    tokens_choice = [tokenizer.bos_token_id] + tokens_choice
     seq = tokens_prompt + tokens_choice
     labels = [0] * len(tokens_prompt) + [1] * len(tokens_choice)
 
@@ -513,6 +522,7 @@ def train_model(
     visualized = False
 
     for step, batch in enumerate(data_loader):
+        start = time.time()
         chunk = batch[0]
         # print(chunk.shape)
         input_ids, labels, attn_mask, mask_mod, position_ids = prepare_batch(
@@ -534,7 +544,6 @@ def train_model(
             print(f"Mask mod: {mask_mod}")
             visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
             visualized = True
-
         optimizer.zero_grad(set_to_none=True)
         outputs = model(
             input_ids.unsqueeze(0),
@@ -546,6 +555,8 @@ def train_model(
         loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-100)
         loss.backward()
         optimizer.step()
+        torch.cuda.synchronize()
+        end = time.time()
 
         loss_val = float(loss.item())
 
@@ -555,7 +566,11 @@ def train_model(
             ckpt_preds = torch.argmax(ckpt_logits, dim=-1)
             ckpt_labels = labels[ckpt_mask]
             ckpt_acc = (ckpt_preds == ckpt_labels).float().mean()
-            print(f"[step {step}] loss={loss_val:.4f} ckpt_acc={ckpt_acc:.4f}")
+            print(f"[step {step}] loss={loss_val:.4f} ckpt_acc={ckpt_acc:.4f} time={end-start:.4f}")
+            wandb.log({
+                "loss": loss_val,
+                "ckpt_acc": ckpt_acc,
+            })
 
         if step % config.eval_interval == 0:
             sample = generate_sample(
@@ -575,20 +590,24 @@ def train_model(
             print(sample)
             print("------------------")
 
-        # if config.mmlu_subjects and step % config.mmlu_eval_interval == 0:
-        #     overall, per_subject = evaluate_mmlu(
-        #         model=model,
-        #         tokenizer=tokenizer,
-        #         device=device,
-        #         config=config,
-        #         ckpt_id=ckpt_id,
-        #         pad_id=pad_id,
-        #         special_ids_tensor=special_ids_tensor,
-        #         use_ckpt=config.use_ckpt,
-        #     )
-        #     print(f"[step {step}] mmlu_overall={overall:.4f}")
-        #     for subject, score in per_subject.items():
-        #         print(f"  {subject}: {score:.4f}")
+        if config.mmlu_subjects and step % config.mmlu_eval_interval == 0:
+            overall, per_subject = evaluate_mmlu(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                config=config,
+                ckpt_id=ckpt_id,
+                pad_id=pad_id,
+                special_ids_tensor=special_ids_tensor,
+                use_ckpt=config.use_ckpt,
+            )
+            print(f"[step {step}] mmlu_overall={overall:.4f}")
+            for subject, score in per_subject.items():
+                print(f"  {subject}: {score:.4f}")
+            wandb.log({
+                "mmlu_overall": overall,
+                **{f"mmlu_{subject}": score for subject, score in per_subject.items()},
+            })
 
 
 # -------------------------
@@ -602,7 +621,20 @@ def main():
     device, device_map, dtype = resolve_runtime_device()
     tokenizer, ckpt_id, pad_id, special_ids_tensor = initialize_tokenizer(config, device)
     model = initialize_model(config=config, tokenizer=tokenizer, device=device, device_map=device_map, dtype=dtype)
-    optimizer = AdamW(model.parameters(), lr=config.lr)
+    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+    # hidden_weights = [p for p in model.model.layers.parameters() if p.ndim >= 2]
+    # hidden_gains_biases = [p for p in model.model.layers.parameters() if p.ndim < 2]
+    # nonhidden_params = [*model.lm_head.parameters(), *model.model.embed_tokens.parameters()]
+
+    # param_groups = [
+    #     dict(params=hidden_weights, use_muon=True,
+    #         lr=0.02, weight_decay=0.01),
+    #     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
+    #         lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
+    # ]
+
+    # optimizer = MuonWithAuxAdam(param_groups)
+
 
     if not config.is_overfit:
         dataset = DistributedTokenDataset(
@@ -610,6 +642,7 @@ def main():
             sequence_length=config.max_tokens,
             ckpt_id=ckpt_id,
             ckpt_stride=config.ckpt_stride,
+            bos_id=tokenizer.bos_token_id,
             local_rank=0,
             world_size=1,
             base_seed=config.seed,
@@ -621,10 +654,11 @@ def main():
             batch_size=1,
             num_workers=4,
             pin_memory=True,
-            prefetch_factor=2,
+            prefetch_factor=4,
         )
     else:
         test_ids = tokenizer.encode(config.fixed_training_prompt, add_special_tokens=False)
+        test_ids = [tokenizer.bos_token_id] + test_ids
         test_ids = insert_checkpoints(test_ids, config.ckpt_stride, ckpt_id)
         test_ids = torch.tensor(test_ids, device=device)
         test_ids = torch.cat([test_ids, torch.tensor([pad_id], device=device), test_ids, torch.tensor([pad_id], device=device)])

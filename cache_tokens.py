@@ -108,7 +108,7 @@ def _worker_init(tokenizer_name: str) -> None:
 def _process_sample(payload: tuple[int, dict]) -> tuple[int, Optional[List[int]]]:
     idx, sample = payload
     text = sample.get("text")
-    ids = _WORKER_TOKENIZER.encode(text, add_special_tokens=False)
+    ids = _WORKER_TOKENIZER.encode(text, add_special_tokens=True)
     ids = ids + [_WORKER_TOKENIZER.pad_token_id]
     return idx, ids
 

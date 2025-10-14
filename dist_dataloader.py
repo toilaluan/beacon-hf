@@ -75,6 +75,7 @@ def distributed_sequence_generator(
     sequence_length: int,
     ckpt_id: int,
     ckpt_stride: int,
+    bos_id: int,
     *,
     local_rank: int,
     world_size: int,
@@ -141,6 +142,7 @@ def distributed_sequence_generator(
                         items = []
                         for start, end in zip(start_selected_docs, end_selected_docs):
                             item = tokens[start:end]
+                            # item = [bos_id] + item
                             item = insert_checkpoints(item, ckpt_stride, ckpt_id)
                             items.extend(item)
                         # print(lengths)
@@ -170,6 +172,7 @@ class DistributedTokenDataset(IterableDataset):
         sequence_length: int,
         ckpt_id: int,
         ckpt_stride: int,
+        bos_id: int,
         *,
         local_rank: int,
         world_size: int,
@@ -182,6 +185,7 @@ class DistributedTokenDataset(IterableDataset):
         self.sequence_length = sequence_length
         self.ckpt_id = ckpt_id
         self.ckpt_stride = ckpt_stride
+        self.bos_id = bos_id
         self.local_rank = local_rank
         self.world_size = world_size
         self.base_seed = base_seed
@@ -192,6 +196,7 @@ class DistributedTokenDataset(IterableDataset):
             self.sequence_length,
             ckpt_id=self.ckpt_id,
             ckpt_stride=self.ckpt_stride,
+            bos_id=self.bos_id,
             local_rank=self.local_rank,
             world_size=self.world_size,
             base_seed=self.base_seed,

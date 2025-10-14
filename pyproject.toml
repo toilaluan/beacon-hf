@@ -9,6 +9,12 @@ dependencies = [
     "accelerator>=2025.9.5",
     "datasets>=4.2.0",
     "matplotlib>=3.10.7",
+    "muon-optimizer",
+    "nvitop>=1.5.3",
     "torch>=2.8.0",
     "transformers>=4.57.0",
+    "wandb>=0.22.2",
 ]
+
+[tool.uv.sources]
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
