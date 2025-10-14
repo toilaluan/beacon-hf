@@ -8,7 +8,7 @@ import torch
 from datasets import load_dataset
 from torch.nn.attention import flex_attention
 from torch.optim import AdamW
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # -------------------------
 # Constants & Small Helpers
@@ -110,7 +110,8 @@ def build_position_ids(ids: torch.Tensor, pad_token_id: Optional[int]) -> torch.
     for doc_id in docs.unique():
         idxs = (docs == doc_id).nonzero(as_tuple=False).flatten()
         position_ids.append(torch.arange(idxs.numel(), device=ids.device))
-    return torch.cat(position_ids, dim=0)
+    position_ids = torch.cat(position_ids, dim=0)
+    return position_ids
 
 
 def create_attention_mask(
@@ -132,7 +133,7 @@ def create_attention_mask(
     special_token_ids = special_token_ids.to(device)
 
     is_ckpt = ids == checkpoint_id
-    is_special = torch.isin(ids, special_token_ids)
+    # is_special = torch.isin(ids, special_token_ids)
 
     # "Beacon group" index for each position: cumsum over checkpoints, but exclude self if checkpoint.
     beacon_ids = is_ckpt.long().cumsum(0) - is_ckpt.long()
@@ -147,7 +148,7 @@ def create_attention_mask(
         causal = q_idx >= kv_idx
         same_doc = docs[kv_idx] == docs[q_idx]
         same_beacon = beacon_ids[kv_idx] == beacon_ids[q_idx]
-        return causal & same_doc & (same_beacon | is_ckpt[kv_idx] | is_special[kv_idx])
+        return causal & same_doc & (same_beacon | is_ckpt[kv_idx])
 
     def causal_mod(_b, _h, q_idx, kv_idx):
         same_doc = docs[kv_idx] == docs[q_idx]
@@ -214,20 +215,20 @@ def stream_token_chunks(
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-1.5B"
-    dataset_name: str = "HuggingFaceFW/fineweb"
-    max_steps: int = 10000
-    max_tokens: int = 128
-    use_ckpt: bool = False
-    ckpt_stride: int = 8
-    lr: float = 1e-5
+    model_name: str = "Qwen/Qwen2.5-0.5B"
+    dataset_name: str = "HuggingFaceFW/finepdfs"
+    max_steps: int = 100000
+    max_tokens: int = 8192
+    use_ckpt: bool = True
+    ckpt_stride: int = 16
+    lr: float = 1e-4
     log_interval: int = 10
     eval_interval: int = 100
     block_size: int = 128
     max_new_tokens: int = 32
-    fixed_prompt: str = "capital of india is new delhi, capital of america is"
+    fixed_prompt: str = "list of all capitals: capital of india is new delhi, capital of america is"
     fixed_training_prompt: str = (
-        "capital of india is new delhi, capital of america is washington d.c., capital of canada is ottawa."
+        "list of all capitals: capital of india is new delhi, capital of america is washington d.c., capital of canada is ottawa."
     )
     is_overfit: bool = False
     shuffle_buffer: int = 10_000
@@ -235,7 +236,7 @@ class TrainConfig:
     mmlu_subjects: Tuple[str, ...] = ("us_foreign_policy", "formal_logic", "high_school_physics")
     mmlu_split: str = "validation"
     mmlu_max_samples: int = 25
-    mmlu_eval_interval: int = 100
+    mmlu_eval_interval: int = 2000
     seed: int = 42
 
 
@@ -279,8 +280,9 @@ def initialize_model(
         attn_implementation="flex_attention",
         torch_dtype=dtype,
     )
-    if device_map is None:
-        model.to(device)
+    # model_config = AutoConfig.from_pretrained(config.model_name)
+    # model = AutoModelForCausalLM.from_config(model_config, attn_implementation="flex_attention", torch_dtype=dtype)
+    model.to(device)
 
     model.resize_token_embeddings(len(tokenizer))
     model.train()
@@ -373,6 +375,7 @@ def generate_sample(
     """
     Greedy decode with the same beacon-aware attention mask as training.
     """
+    model.eval()
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
     if not prompt_tokens:
         return ""
@@ -404,7 +407,7 @@ def generate_sample(
         ).logits[:, -1, :]
         next_id = logits.argmax(dim=-1)
         val_ids = torch.cat([val_ids, next_id], dim=0)
-
+    model.train()
     return tokenizer.decode(val_ids.tolist())
 
 
@@ -469,7 +472,6 @@ def evaluate_mmlu(
     if not config.mmlu_subjects:
         return 0.0, {}
 
-    was_training = model.training
     model.eval()
 
     overall_correct = 0
@@ -545,8 +547,7 @@ def evaluate_mmlu(
         overall_correct += subject_correct
         overall_total += subject_total
 
-    if was_training:
-        model.train()
+    model.train()
 
     overall_score = overall_correct / overall_total if overall_total else 0.0
     return overall_score, subject_scores
@@ -586,36 +587,35 @@ def train_model(
 
         # Optional one-time visualization (if user has a visualize module)
         if not visualized:
-            try:
-                print(f"Input IDs sample: {tokenizer.decode(input_ids.tolist())}")
-                from visualize import visualize_attention_scores  # pragma: no cover
-                q = torch.zeros((1, 1, len(input_ids), 4), device=device)
-                k = torch.zeros((1, 1, len(input_ids), 4), device=device)
-                visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
-            except Exception:
-                pass
+            print(f"Input IDs sample: {tokenizer.decode(input_ids.tolist())}")
+            from visualize import visualize_attention_scores  # pragma: no cover
+            q = torch.zeros((1, 1, len(input_ids), 4), device=device)
+            k = torch.zeros((1, 1, len(input_ids), 4), device=device)
+            print(f"Mask mod: {mask_mod}")
+            visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
             visualized = True
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(
+        outputs = model(
             input_ids.unsqueeze(0),
             attention_mask=attn_mask,
             position_ids=position_ids.unsqueeze(0),
-        ).logits[0]
-
-        valid = labels != -100
-        if not valid.any():
-            continue
-
-        loss = torch.nn.functional.cross_entropy(logits[valid], labels[valid])
+            # labels=labels.unsqueeze(0),
+        )
+        logits = outputs.logits[0]
+        loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-100)
         loss.backward()
         optimizer.step()
 
         loss_val = float(loss.item())
-        running_ema = loss_val if step == 1 else (running_ema * ema_beta + loss_val * (1 - ema_beta))
 
         if step % config.log_interval == 0 or step == 1:
-            print(f"[step {step}] loss={loss_val:.4f} ema={running_ema:.4f}")
+            ckpt_mask = input_ids == ckpt_id
+            ckpt_logits = outputs.logits[0, ckpt_mask, :]
+            ckpt_preds = torch.argmax(ckpt_logits, dim=-1)
+            ckpt_labels = labels[ckpt_mask]
+            ckpt_acc = (ckpt_preds == ckpt_labels).float().mean()
+            print(f"[step {step}] loss={loss_val:.4f} ckpt_acc={ckpt_acc:.4f}")
 
         if step % config.eval_interval == 0:
             sample = generate_sample(
