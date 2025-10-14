@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import islice, repeat
 from typing import Callable, Iterable, Iterator, List, Sequence, Tuple, Dict, Optional
-
+from pathlib import Path
 import torch
 from datasets import load_dataset
 from torch.nn.attention import flex_attention
 from torch.optim import AdamW
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
+from dist_dataloader import DistributedTokenDataset
 # -------------------------
 # Constants & Small Helpers
 # -------------------------
@@ -215,15 +215,15 @@ def stream_token_chunks(
 
 @dataclass
 class TrainConfig:
-    model_name: str = "Qwen/Qwen2.5-0.5B"
+    model_name: str = "Qwen/Qwen2.5-1.5B"
     dataset_name: str = "HuggingFaceFW/finepdfs"
     max_steps: int = 100000
-    max_tokens: int = 8192
+    max_tokens: int = 8192*4
     use_ckpt: bool = True
     ckpt_stride: int = 16
     lr: float = 1e-4
     log_interval: int = 10
-    eval_interval: int = 100
+    eval_interval: int = 2000
     block_size: int = 128
     max_new_tokens: int = 32
     fixed_prompt: str = "list of all capitals: capital of india is new delhi, capital of america is"
@@ -286,7 +286,7 @@ def initialize_model(
 
     model.resize_token_embeddings(len(tokenizer))
     model.train()
-    # model = torch.compile(model)
+    model = torch.compile(model)
     return model
 
 
@@ -561,7 +561,7 @@ def train_model(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     optimizer: AdamW,
-    token_stream: Iterable[List[int]],
+    data_loader: Iterable[List[int]],
     config: TrainConfig,
     *,
     device: torch.device,
@@ -570,11 +570,11 @@ def train_model(
     special_ids_tensor: torch.Tensor,
     use_ckpt: bool,
 ) -> None:
-    running_ema = 0.0
-    ema_beta = 0.9
     visualized = False
 
-    for step, chunk in enumerate(islice(token_stream, config.max_steps), start=1):
+    for step, batch in enumerate(data_loader):
+        chunk = batch[0]
+        # print(chunk.shape)
         input_ids, labels, attn_mask, mask_mod, position_ids = prepare_batch(
             chunk,
             device=device,
@@ -589,8 +589,8 @@ def train_model(
         if not visualized:
             print(f"Input IDs sample: {tokenizer.decode(input_ids.tolist())}")
             from visualize import visualize_attention_scores  # pragma: no cover
-            q = torch.zeros((1, 1, len(input_ids), 4), device=device)
-            k = torch.zeros((1, 1, len(input_ids), 4), device=device)
+            q = torch.zeros((1, 1, len(input_ids[:90]), 4), device=device)
+            k = torch.zeros((1, 1, len(input_ids[:90]), 4), device=device)
             print(f"Mask mod: {mask_mod}")
             visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
             visualized = True
@@ -664,12 +664,31 @@ def main():
     model = initialize_model(config=config, tokenizer=tokenizer, device=device, device_map=device_map, dtype=dtype)
     optimizer = AdamW(model.parameters(), lr=config.lr)
 
-    token_stream = create_token_stream(config=config, tokenizer=tokenizer, ckpt_id=ckpt_id, pad_id=pad_id)
+    # token_stream = create_token_stream(config=config, tokenizer=tokenizer, ckpt_id=ckpt_id, pad_id=pad_id)
+    dataset = DistributedTokenDataset(
+        dataset_path=Path("tokenized_data"),
+        sequence_length=config.max_tokens,
+        ckpt_id=ckpt_id,
+        ckpt_stride=config.ckpt_stride,
+        local_rank=0,
+        world_size=1,
+        base_seed=config.seed,
+    )
+    from torch.utils.data import DataLoader
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+    print(next(iter(dataloader))[0].shape)
     train_model(
         model=model,
         tokenizer=tokenizer,
         optimizer=optimizer,
-        token_stream=token_stream,
+        data_loader=dataloader,
         config=config,
         device=device,
         ckpt_id=ckpt_id,
