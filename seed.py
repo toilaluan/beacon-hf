@@ -14,6 +14,14 @@ from muon import MuonWithAuxAdam
 import wandb
 import time
 
+torch_compile_options = {
+    "epilogue_fusion"   : True,
+    "max_autotune"      : True,
+    "shape_padding"     : True,
+    "triton.cudagraphs" : False,
+}
+
+flex_attention.flex_attention = torch.compile(flex_attention.flex_attention, dynamic = True, options = torch_compile_options)
 
 wandb.init(project="ckpt-llm")
 # -------------------------
@@ -100,7 +108,7 @@ def maybe_append_ckpt(seq: torch.Tensor, ckpt_token_id: int, stride: int) -> tor
 # Mask & Positions
 # -------------------------
 
-def build_position_ids(ids: torch.Tensor, pad_token_id: Optional[int]) -> torch.Tensor:
+def build_position_ids(ids: torch.Tensor, pad_token_id: Optional[int], device: torch.device) -> torch.Tensor:
     """
     Monotonic 0..N per document (docs delimited by pad_token_id). Entire sequence is 1 doc if pad_token_id is None.
     """
@@ -109,13 +117,13 @@ def build_position_ids(ids: torch.Tensor, pad_token_id: Optional[int]) -> torch.
 
     if pad_token_id is None or (ids == pad_token_id).sum() == 0:
         # Single doc: simple arange
-        return torch.arange(ids.numel(), device=ids.device)
+        return torch.arange(ids.numel(), device=device)
 
     docs = (ids == pad_token_id).long().cumsum(0)
     position_ids = []
     for doc_id in docs.unique():
         idxs = (docs == doc_id).nonzero(as_tuple=False).flatten()
-        position_ids.append(torch.arange(idxs.numel(), device=ids.device))
+        position_ids.append(torch.arange(idxs.numel(), device=device))
     position_ids = torch.cat(position_ids, dim=0)
     return position_ids
 
@@ -191,15 +199,14 @@ def format_mmlu_prompt(question: str, choices: Sequence[str]) -> str:
 
 @dataclass
 class TrainConfig:
-    model_name: str = "meta-llama/Llama-3.2-1B"
-    dataset_name: str = "HuggingFaceFW/finepdfs"
+    model_name: str = "Qwen/Qwen2.5-0.5B"
     max_steps: int = 100000
-    max_tokens: int = 1024*12
+    max_tokens: int = 1024*16
     use_ckpt: bool = True
-    ckpt_stride: int = 16
-    lr: float = 1e-4
-    log_interval: int = 10
-    eval_interval: int = 500
+    ckpt_stride: int = 7
+    lr: float = 5e-5
+    log_interval: int = 1
+    eval_interval: int = 100
     block_size: int = 128
     max_new_tokens: int = 32
     fixed_prompt: str = "list of all capitals: capital of india is new delhi, capital of america is"
@@ -233,10 +240,11 @@ def initialize_tokenizer(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     tokenizer.add_special_tokens({"cls_token": "<|checkpoint|>"})
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    tokenizer.add_special_tokens({"bos_token": "<|bos|>"})
 
     ckpt_id = tokenizer.cls_token_id
     pad_id = tokenizer.pad_token_id
-
+    bos_id = tokenizer.bos_token_id
     special_ids = set(tokenizer.all_special_ids)
     special_ids.add(ckpt_id)
     special_ids_tensor = torch.tensor(sorted(special_ids), device=device)
@@ -262,7 +270,7 @@ def initialize_model(
 
     model.resize_token_embeddings(len(tokenizer))
     model.train()
-    # model = torch.compile(model)
+    # model = torch.compile(model, dynamic = True, options = torch_compile_options)
     return model
 
 # -------------------------
@@ -281,9 +289,8 @@ def prepare_batch(
     """
     Convert a token chunk into training tensors (input_ids, labels, block mask, mask fn, position_ids).
     """
-    full_ids = torch.tensor(chunk)
-    train_ids = full_ids[:-1].to(device, non_blocking=True)
-    labels = full_ids[1:].clone().to(device, non_blocking=True)
+    train_ids = torch.tensor(chunk, device=device)
+    labels = train_ids.detach().clone()
 
     # Ignore loss on special tokens
     labels[labels == ckpt_id] = -100
@@ -291,7 +298,7 @@ def prepare_batch(
         labels[labels == pad_id] = -100
 
     # Positions are per-doc (using pad delimiters), shifted to align with input_ids
-    position_ids = build_position_ids(full_ids, pad_id)[:-1].to(device, non_blocking=True)
+    position_ids = build_position_ids(train_ids, pad_id, device)
 
     attn_mask, mask_mod = create_attention_mask(
         train_ids,
@@ -340,7 +347,7 @@ def generate_sample(
             continue
 
         # Recompute mask on growth
-        pos_ids = build_position_ids(val_ids, pad_id)
+        pos_ids = build_position_ids(val_ids, pad_id, device)
         attn_mask, _ = create_attention_mask(
             val_ids,
             special_token_ids=special_ids_tensor,
@@ -378,7 +385,7 @@ def _choice_logprob_sum(
     tokens_prompt = tokenizer.encode(base_prompt, add_special_tokens=False)
     tokens_choice = tokenizer.encode(completion, add_special_tokens=False)
     tokens_prompt = [tokenizer.bos_token_id] + tokens_prompt
-    tokens_choice = [tokenizer.bos_token_id] + tokens_choice
+    # tokens_choice = [tokenizer.bos_token_id] + tokens_choice
     seq = tokens_prompt + tokens_choice
     labels = [0] * len(tokens_prompt) + [1] * len(tokens_choice)
 
@@ -389,7 +396,7 @@ def _choice_logprob_sum(
     seq_t = torch.tensor(seq, device=device)
     input_ids = seq_t[:-1]
     target_ids = seq_t[1:]
-    pos_ids = build_position_ids(seq_t, pad_id)[:-1]
+    pos_ids = build_position_ids(seq_t, pad_id, device)[:-1]
 
     attn_mask, _ = create_attention_mask(
         input_ids, special_token_ids=special_ids_tensor, checkpoint_id=ckpt_id, pad_id=pad_id, block_size=block_size, use_ckpt=use_ckpt
@@ -539,20 +546,22 @@ def train_model(
         if not visualized:
             print(f"Input IDs sample: {tokenizer.decode(input_ids.tolist())}")
             from visualize import visualize_attention_scores  # pragma: no cover
-            q = torch.zeros((1, 1, len(input_ids[:90]), 4), device=device)
-            k = torch.zeros((1, 1, len(input_ids[:90]), 4), device=device)
+            q = torch.zeros((1, 1, len(input_ids[:1024]), 4), device=device)
+            k = torch.zeros((1, 1, len(input_ids[:1024]), 4), device=device)
             print(f"Mask mod: {mask_mod}")
             visualize_attention_scores(q, k, mask_mod=mask_mod, device=device)
             visualized = True
+            print(input_ids.shape)
         optimizer.zero_grad(set_to_none=True)
         outputs = model(
             input_ids.unsqueeze(0),
             attention_mask=attn_mask,
             position_ids=position_ids.unsqueeze(0),
-            # labels=labels.unsqueeze(0),
+            labels=labels.unsqueeze(0),
         )
-        logits = outputs.logits[0]
-        loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-100)
+        # logits = outputs.logits[0]
+        # loss = torch.nn.functional.cross_entropy(logits, labels, ignore_index=-100)
+        loss = outputs.loss
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
@@ -564,6 +573,8 @@ def train_model(
             ckpt_mask = input_ids == ckpt_id
             ckpt_logits = outputs.logits[0, ckpt_mask, :]
             ckpt_preds = torch.argmax(ckpt_logits, dim=-1)
+            labels = torch.roll(labels, 1)
+            labels[0] = -100
             ckpt_labels = labels[ckpt_mask]
             ckpt_acc = (ckpt_preds == ckpt_labels).float().mean()
             print(f"[step {step}] loss={loss_val:.4f} ckpt_acc={ckpt_acc:.4f} time={end-start:.4f}")
@@ -643,6 +654,7 @@ def main():
             ckpt_id=ckpt_id,
             ckpt_stride=config.ckpt_stride,
             bos_id=tokenizer.bos_token_id,
+            pad_id=pad_id,
             local_rank=0,
             world_size=1,
             base_seed=config.seed,
